@@ -287,8 +287,8 @@ class VectorStoreManager:
                     collection = vector_store._collection
                     if hasattr(collection, 'count'):
                         info["document_count"] = collection.count()
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"获取文档数量失败: {e}")
             
             # 尝试获取更多信息
             if self.store_type == "chroma":
