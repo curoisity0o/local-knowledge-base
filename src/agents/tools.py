@@ -182,7 +182,8 @@ def create_file_reader_tool(base_path: str = "./data") -> Callable:
             max_lines: 最大读取行数
         """
         try:
-            full_path = Path(base_path) / file_path
+            # 使用safe_join防止路径遍历攻击
+            full_path = safe_join(base_path, file_path)
             if not full_path.exists():
                 return f"文件不存在: {file_path}"
 
@@ -195,11 +196,46 @@ def create_file_reader_tool(base_path: str = "./data") -> Callable:
                     lines.append(line.rstrip())
 
             return "\n".join(lines)
+        except ValueError as e:
+            logger.warning(f"路径安全检查失败: {e}")
+            return f"路径访问被拒绝: {str(e)}"
         except Exception as e:
             logger.error(f"读取文件失败: {e}")
             return f"读取失败: {str(e)}"
 
     return read_file
+
+
+def safe_join(base_path: str, user_path: str) -> Path:
+    """
+    安全地拼接路径，防止路径遍历攻击
+    
+    Args:
+        base_path: 基础路径
+        user_path: 用户提供的相对路径
+        
+    Returns:
+        安全的绝对路径
+        
+    Raises:
+        ValueError: 如果检测到路径遍历攻击
+    """
+    # 解析路径
+    base = Path(base_path).resolve()
+    user = Path(user_path)
+    
+    # 防止绝对路径
+    if user.is_absolute():
+        raise ValueError("路径遍历攻击检测：不允许绝对路径")
+    
+    # 拼接并解析路径
+    full_path = (base / user).resolve()
+    
+    # 验证结果路径在基础路径内
+    if not str(full_path).startswith(str(base)):
+        raise ValueError("路径遍历攻击检测：路径越界")
+    
+    return full_path
 
 
 def safe_eval(expression: str, allowed_names: Dict[str, Any]) -> Any:
@@ -277,6 +313,7 @@ def safe_eval(expression: str, allowed_names: Dict[str, Any]) -> Any:
         raise ValueError(f"表达式求值失败: {e}")
 
 
+def create_calculator_tool() -> Callable:
     """创建计算器工具"""
 
     def calculate(expression: str) -> str:
