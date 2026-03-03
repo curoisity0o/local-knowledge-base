@@ -1,0 +1,59 @@
+# 本地知识库系统 - Docker 配置
+# 使用方法: docker-compose up -d
+
+version: '3.8'
+
+services:
+  # 主应用
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"      # API服务
+      - "8501:8501"     # Streamlit前端
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=INFO
+      - CHROMA_PERSIST_DIR=/app/data/vector_store/chroma
+      # Ollama配置 (需要宿主机运行Ollama)
+      - OLLAMA_HOST=host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 可选: Ollama 服务 (如果需要独立容器)
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama_models:/root/.ollama
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+
+volumes:
+  # ollama_models:
+  #   driver: local
+  data:
+    driver: local
+  logs:
+    driver: local
+
+networks:
+  default:
+    name: knowledge-base-network

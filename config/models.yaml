@@ -1,0 +1,218 @@
+# 模型配置
+
+# 本地模型选项
+local_models:
+  deepseek_v2_lite:
+    name: "deepseek-v2-lite"
+    display_name: "DeepSeek V2 Lite"
+    description: "DeepSeek V2 Lite 16B MoE 模型，4-bit量化，显存占用低"
+    provider: "ollama"
+    model_id: "deepseek-v2-lite:16b-q4_K_M"
+    context_window: 64000
+    quantization: "Q4_K_M"
+    estimated_vram_gb: 3.5
+    languages: ["zh", "en"]
+    strengths: ["长上下文", "显存效率", "中英文混合"]
+    weaknesses: ["中文略微不如Qwen", "需要Ollama"]
+    
+  qwen2_5_7b:
+    name: "qwen2.5-7b"
+    display_name: "Qwen2.5 7B"
+    description: "Qwen2.5 7B 模型，中文优化，4-bit量化"
+    provider: "ollama"
+    model_id: "qwen2.5:7b-instruct-q4_K_M"
+    context_window: 32000
+    quantization: "Q4_K_M"
+    estimated_vram_gb: 4.5
+    languages: ["zh", "en"]
+    strengths: ["中文能力强", "生态成熟", "响应速度快"]
+    weaknesses: ["显存占用较大", "上下文窗口较小"]
+    
+  yi_6b:
+    name: "yi-6b"
+    display_name: "Yi 6B"
+    description: "Yi 6B 模型，轻量级，4-bit量化"
+    provider: "ollama"
+    model_id: "yi:6b-chat-q4_K_M"
+    context_window: 4096
+    quantization: "Q4_K_M"
+    estimated_vram_gb: 3.0
+    languages: ["zh", "en"]
+    strengths: ["轻量级", "速度快", "中文不错"]
+    weaknesses: ["上下文短", "能力有限"]
+
+# 嵌入模型选项
+embedding_models:
+  text2vec_chinese:
+    name: "text2vec-chinese"
+    display_name: "Text2Vec Chinese"
+    description: "轻量级中文文本嵌入模型，约400MB，适合国内网络环境"
+    model_id: "shibing624/text2vec-chinese-sentence"
+    dimensions: 768
+    context_length: 256
+    languages: ["zh"]
+    estimated_memory_gb: 0.5
+    device: "cpu"
+    strengths: ["轻量快速", "中文专用", "国内友好"]
+    weaknesses: ["仅支持中文", "维度较低"]
+    
+  bge_m3:
+    name: "bge-m3"
+    display_name: "BGE-M3"
+    description: "BAAI 的 BGE-M3 嵌入模型，中英文优化，支持密集、稀疏和多向量检索"
+    model_id: "BAAI/bge-m3"
+    dimensions: 1024
+    context_length: 8192
+    languages: ["zh", "en"]
+    estimated_memory_gb: 1.5
+    device: "cpu"  # 推荐CPU运行节省显存
+    strengths: ["中文优化", "多功能检索", "质量稳定"]
+    weaknesses: ["模型较大", "推理速度中等"]
+    
+  nomic_embed_text:
+    name: "nomic-embed-text"
+    display_name: "Nomic Embed Text"
+    description: "Nomic 的通用文本嵌入模型，8192上下文长度，英文表现优秀"
+    model_id: "nomic-ai/nomic-embed-text-v1.5"
+    dimensions: 768
+    context_length: 8192
+    languages: ["en", "multilingual"]
+    estimated_memory_gb: 1.0
+    device: "cpu"
+    strengths: ["长上下文", "英文优秀", "效率高"]
+    weaknesses: ["中文不如BGE", "功能单一"]
+    
+  gte_large:
+    name: "gte-large"
+    display_name: "GTE-Large"
+    description: "通用文本嵌入模型，中英文平衡表现"
+    model_id: "thenlper/gte-large"
+    dimensions: 1024
+    context_length: 512
+    languages: ["multilingual"]
+    estimated_memory_gb: 1.2
+    device: "cpu"
+    strengths: ["通用性强", "质量稳定", "社区支持好"]
+    weaknesses: ["上下文短", "中文不如BGE"]
+
+# 重排序模型选项
+reranker_models:
+  bge_reranker_large:
+    name: "bge-reranker-large"
+    display_name: "BGE Reranker Large"
+    description: "BAAI 的 BGE 重排序模型，用于提升检索精度"
+    model_id: "BAAI/bge-reranker-large"
+    device: "cpu"
+    estimated_memory_gb: 1.8
+    max_length: 512
+    
+  cohere_rerank:
+    name: "cohere-rerank"
+    display_name: "Cohere Rerank"
+    description: "Cohere 的重排序API服务，质量高但需要API调用"
+    provider: "cohere"
+    api_required: true
+    estimated_cost_per_1k: 0.10  # 美元
+
+# API 模型选项
+api_models:
+  openai:
+    gpt_4o:
+      name: "gpt-4o"
+      display_name: "GPT-4o"
+      description: "OpenAI GPT-4o 模型，平衡速度和质量"
+      context_window: 128000
+      input_price_per_1k: 0.005
+      output_price_per_1k: 0.015
+      
+    gpt_4o_mini:
+      name: "gpt-4o-mini"
+      display_name: "GPT-4o-mini"
+      description: "OpenAI GPT-4o-mini 模型，性价比高"
+      context_window: 128000
+      input_price_per_1k: 0.0015
+      output_price_per_1k: 0.006
+      
+  deepseek:
+    deepseek_chat:
+      name: "deepseek-chat"
+      display_name: "DeepSeek Chat"
+      description: "DeepSeek 聊天模型，性价比极高"
+      context_window: 64000
+      input_price_per_1k: 0.00014
+      output_price_per_1k: 0.00028
+      
+  anthropic:
+    claude_3_5_sonnet:
+      name: "claude-3-5-sonnet"
+      display_name: "Claude 3.5 Sonnet"
+      description: "Anthropic Claude 3.5 Sonnet，推理能力强"
+      context_window: 200000
+      input_price_per_1k: 0.003
+      output_price_per_1k: 0.015
+      
+    claude_3_haiku:
+      name: "claude-3-haiku"
+      display_name: "Claude 3 Haiku"
+      description: "Anthropic Claude 3 Haiku，速度快成本低"
+      context_window: 200000
+      input_price_per_1k: 0.0008
+      output_price_per_1k: 0.004
+
+# 默认配置
+defaults:
+  local_model: "deepseek_v2_lite"
+  embedding_model: "bge_m3"
+  api_model: "gpt_4o_mini"
+  
+  # 硬件感知的默认配置
+  hardware_aware_defaults:
+    low_vram:  # < 8GB 显存
+      local_model: "yi_6b"
+      embedding_device: "cpu"
+      enable_reranking: false
+      
+    medium_vram:  # 8-12GB 显存
+      local_model: "qwen2_5_7b"
+      embedding_device: "cpu"
+      enable_reranking: true
+      
+    high_vram:  # > 12GB 显存
+      local_model: "deepseek_v2_lite"
+      embedding_device: "cuda"
+      enable_reranking: true
+      
+    # 根据用户硬件自动选择
+    auto_detect: true
+
+# 模型组合推荐
+recommended_combinations:
+  - name: "中文优化组合"
+    description: "针对中文文档的优化配置"
+    local_model: "qwen2_5_7b"
+    embedding_model: "bge_m3"
+    reranker_model: "bge_reranker_large"
+    languages: ["zh"]
+    
+  - name: "显存优化组合"
+    description: "低显存环境的最佳配置"
+    local_model: "deepseek_v2_lite"
+    embedding_model: "nomic_embed_text"
+    embedding_device: "cpu"
+    enable_reranking: false
+    estimated_total_vram_gb: 3.5
+    
+  - name: "质量优先组合"
+    description: "追求最高回答质量的配置"
+    local_model: "qwen2_5_7b"
+    embedding_model: "bge_m3"
+    reranker_model: "bge_reranker_large"
+    api_fallback: "gpt_4o"
+    estimated_total_vram_gb: 6.0
+    
+  - name: "成本优化组合"
+    description: "控制API使用成本的配置"
+    local_model: "deepseek_v2_lite"
+    embedding_model: "gte_large"
+    api_usage: "minimal"
+    daily_budget: 1.0

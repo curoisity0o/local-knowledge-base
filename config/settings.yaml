@@ -1,0 +1,287 @@
+# 应用设置
+app:
+  name: "local-knowledge-base"
+  version: "1.0.0"
+  environment: "${ENVIRONMENT:-development}"
+  debug: false
+  log_level: "${LOG_LEVEL:-INFO}"
+
+# 数据路径
+paths:
+  data_dir: "${DATA_DIR:-./data}"
+  raw_docs: "${RAW_DOCS_DIR:-${paths.data_dir}/raw_docs}"
+  processed: "${PROCESSED_DIR:-${paths.data_dir}/processed}"
+  vector_store: "${VECTOR_STORE_DIR:-${paths.data_dir}/vector_store}"
+  logs: "./logs"
+
+# 文档处理
+document_processing:
+  supported_formats:
+    - "pdf"
+    - "docx"
+    - "txt"
+    - "md"
+    - "html"
+    - "csv"
+  
+  chunking:
+    chunk_size: "${CHUNK_SIZE:-800}"
+    chunk_overlap: "${CHUNK_OVERLAP:-100}"
+    max_chunks_per_doc: "${MAX_CHUNKS_PER_DOC:-100}"
+    
+  text_splitter:
+    type: "recursive_character"
+    separators: ["\n\n", "\n", "。", "？", "！", "；", "?", "!", ";", "…", "……"]
+    keep_separator: true
+    
+  preprocessing:
+    remove_extra_whitespace: true
+    normalize_unicode: true
+    handle_mixed_language: true
+
+# 向量存储
+vector_store:
+  type: "${VECTOR_DB_TYPE:-chroma}"
+  
+  chroma:
+    persist_directory: "${CHROMA_PERSIST_DIR:-${paths.vector_store}/chroma}"
+    collection_name: "${CHROMA_COLLECTION_NAME:-knowledge_base}"
+    embedding_function: "bge-m3"
+    
+  qdrant:
+    url: "http://localhost:6333"
+    collection_name: "knowledge_base"
+    prefer_grpc: false
+    
+  faiss:
+    index_path: "${paths.vector_store}/faiss.index"
+    index_type: "IndexFlatIP"
+
+# 嵌入模型
+embeddings:
+  # 国内环境推荐使用 text2vec-chinese-sentence (约400MB)
+  # 如需更高质量可使用 BAAI/bge-m3 (需配置镜像)
+  model: "${EMBEDDING_MODEL:-shibing624/text2vec-chinese-sentence}"
+  device: "cpu"
+  batch_size: 32
+  normalize_embeddings: true
+  max_length: 512
+  
+  # HuggingFace 镜像配置（解决国内网络问题）
+  hf_mirror: "${HF_MIRROR:-https://hf-mirror.com}"
+  
+  cache:
+    enabled: true
+    ttl_seconds: 3600
+    max_size_mb: 1000
+
+# RAG配置
+rag:
+  retriever:
+    type: "hybrid"  # hybrid, dense, sparse
+    top_k: "${RETRIEVAL_TOP_K:-4}"
+    score_threshold: "${RETRIEVAL_SCORE_THRESHOLD:-0.7}"
+    
+    dense:
+      search_type: "similarity"  # similarity, mmr
+      fetch_k: 20
+      
+    sparse:
+      bm25_k1: 1.5
+      bm25_b: 0.75
+      
+    hybrid:
+      fusion_method: "weighted"  # weighted, reciprocal_rank_fusion
+      dense_weight: 0.7
+      sparse_weight: 0.3
+  
+  reranking:
+    enabled: "${ENABLE_RERANKING:-false}"
+    model: "${RERANKER_MODEL:-BAAI/bge-reranker-large}"
+    top_n: 3
+    
+  generation:
+    prompt_template: |
+      基于以下参考文档回答用户问题。请确保答案准确、完整，并注明引用来源。
+      
+      参考文档：
+      {context}
+      
+      用户问题：{question}
+      
+      请用中文回答：
+    temperature: 0.1
+    max_tokens: 2000
+    streaming: true
+
+# Agent配置
+agents:
+  enabled: "${ENABLE_AGENTS:-true}"
+  
+  base_agent:
+    max_iterations: "${AGENT_MAX_ITERATIONS:-5}"
+    early_stopping: true
+    reflection_enabled: true
+    
+  tools:
+    enabled_tools: "${AGENT_TOOLS:-['retrieval', 'calculator', 'web_search']}"
+    
+    retrieval:
+      top_k: 4
+      include_sources: true
+      
+    calculator:
+      precision: 4
+      
+    web_search:
+      max_results: 3
+      timeout: 10
+
+# LLM配置
+llm:
+  # 默认模式：auto, local_only, api_only, local_first
+  default_mode: "auto"
+  
+  local:
+    provider: "ollama"
+    
+    ollama:
+      base_url: "http://localhost:11434"
+      model: "deepseek-v2-lite:16b-q4_K_M"
+      temperature: 0.1
+      context_window: 64000
+      num_predict: 1024
+      streaming: true
+      
+    vllm:
+      api_url: "http://localhost:8000/v1"
+      model: "Qwen/Qwen2.5-7B-Instruct"
+      tensor_parallel_size: 1
+      
+    transformers:
+      model_path: "Qwen/Qwen2.5-7B-Instruct"
+      device_map: "auto"
+      load_in_4bit: true
+  
+  api:
+    enabled: true
+    default_provider: "deepseek"
+    fallback_enabled: true
+    
+    openai:
+      api_key: "${OPENAI_API_KEY}"
+      model: "gpt-4o-mini"
+      base_url: "https://api.openai.com/v1"
+      max_tokens: 2000
+      temperature: 0.1
+      
+    deepseek:
+      api_key: "${DEEPSEEK_API_KEY}"
+      model: "deepseek-chat"
+      base_url: "https://api.deepseek.com"
+      max_tokens: 2000
+      temperature: 0.1
+      
+    kimi:
+      api_key: "${KIMI_API_KEY}"
+      model: "moonshot-v1-8k-vision-preview"
+      base_url: "https://api.moonshot.cn/v1"
+      max_tokens: 2000
+      temperature: 0.1
+      
+    anthropic:
+       api_key: "${ANTHROPIC_API_KEY}"
+       model: "claude-3-haiku-20240307"
+       max_tokens: 2000
+    
+  routing:
+    rules:
+      - condition: "query.requires_realtime_info"
+        action: "use_api"
+        priority: 1
+        
+      - condition: "query.complexity > 0.8"
+        action: "use_api"
+        priority: 2
+        
+      - condition: "context_length > 32000"
+        action: "use_api"
+        priority: 3
+        
+      - condition: "query.sensitivity == 'high'"
+        action: "use_local"
+        priority: 1
+        
+      - condition: "cost_today > budget_daily * 0.8"
+        action: "use_local"
+        priority: 2
+
+# 成本控制
+cost_control:
+  enabled: true
+  budget_daily: 10.0  # 美元
+  auto_switch_to_local: true
+  daily_api_limit: 50
+  
+  providers:
+    openai:
+      input_price_per_1k: 0.0015  # GPT-4o-mini 输入价格
+      output_price_per_1k: 0.0060  # GPT-4o-mini 输出价格
+      
+    deepseek:
+      input_price_per_1k: 0.00014
+      output_price_per_1k: 0.00028
+      
+    anthropic:
+      input_price_per_1k: 0.00080  # Claude 3 Haiku
+      output_price_per_1k: 0.00400
+
+# 服务器配置
+server:
+  api:
+    host: "${API_HOST:-0.0.0.0}"
+    port: "${API_PORT:-8000}"
+    workers: 2
+    reload: true
+    
+  frontend:
+    streamlit:
+      port: "${STREAMLIT_PORT:-8501}"
+      theme: "light"
+      
+    gradio:
+      port: 7860
+      share: false
+
+# 监控和日志
+monitoring:
+  enabled: true
+  
+  metrics:
+    enable_prometheus: true
+    port: 9090
+    
+  logging:
+    file: "${paths.logs}/app.log"
+    max_size_mb: 100
+    backup_count: 5
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    
+  health_check:
+    endpoint: "/health"
+    interval_seconds: 30
+
+# 硬件配置
+hardware:
+  cuda:
+    visible_devices: "${CUDA_VISIBLE_DEVICES:-0}"
+    allow_tf32: true
+    
+  memory:
+    max_gpu_memory: "${MAX_GPU_MEMORY:-10GB}"
+    cpu_worker_threads: "${CPU_WORKER_THREADS:-6}"
+    
+  optimization:
+    enable_flash_attention: true
+    enable_tensor_parallel: false
+    enable_paged_attention: true
