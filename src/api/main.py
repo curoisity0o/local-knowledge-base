@@ -9,6 +9,8 @@ from pydantic import BaseModel
 from typing import List, Optional
 import uvicorn
 import logging
+import os
+import os
 
 from core.config import config
 from core.document_processor import DocumentProcessor
@@ -27,10 +29,21 @@ app = FastAPI(
 )
 
 # 添加 CORS 中间件
+# 从环境变量读取允许的来源，支持多个来源用逗号分隔
+cors_origins = os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
+if cors_origins == [""]:
+    cors_origins = [
+        "http://localhost:8501",    # Streamlit前端
+        "http://localhost:3000",    # React/Vue前端
+        "http://127.0.0.1:8501",
+        "http://127.0.0.1:3000",
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
