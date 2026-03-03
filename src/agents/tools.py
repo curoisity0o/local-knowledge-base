@@ -5,6 +5,8 @@ Agent 工具定义
 
 from typing import Dict, Any, List, Optional, Callable
 from pathlib import Path
+import ast
+import operator
 import logging
 import json
 
@@ -200,7 +202,81 @@ def create_file_reader_tool(base_path: str = "./data") -> Callable:
     return read_file
 
 
-def create_calculator_tool() -> Callable:
+def safe_eval(expression: str, allowed_names: Dict[str, Any]) -> Any:
+    """
+    安全地求值数学表达式
+    
+    Args:
+        expression: 数学表达式字符串
+        allowed_names: 允许使用的变量名和值
+        
+    Returns:
+        表达式求值结果
+        
+    Raises:
+        ValueError: 表达式不安全或求值失败
+    """
+    # 允许的操作符
+    SAFE_OPERATORS = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.Pow: operator.pow,
+        ast.Mod: operator.mod,
+        ast.USub: operator.neg,  # 一元负号
+        ast.UAdd: operator.pos,  # 一元正号
+    }
+    
+    # 检查表达式长度（防止DoS）
+    if len(expression) > 1000:
+        raise ValueError("表达式过长")
+    
+    try:
+        # 解析表达式为AST
+        tree = ast.parse(expression, mode='eval')
+        
+        # 定义AST节点检查器
+        def check_node(node):
+            """递归检查AST节点安全性"""
+            if isinstance(node, ast.Expression):
+                return check_node(node.body)
+            elif isinstance(node, ast.BinOp):
+                if type(node.op) not in SAFE_OPERATORS:
+                    raise ValueError(f"不允许的操作符: {type(node.op)}")
+                check_node(node.left)
+                check_node(node.right)
+            elif isinstance(node, ast.UnaryOp):
+                if type(node.op) not in SAFE_OPERATORS:
+                    raise ValueError(f"不允许的一元操作符: {type(node.op)}")
+                check_node(node.operand)
+            elif isinstance(node, ast.Num):
+                return  # 数字是安全的
+            elif isinstance(node, ast.Name):
+                if node.id not in allowed_names:
+                    raise ValueError(f"未允许的变量名: {node.id}")
+            elif isinstance(node, ast.Call):
+                raise ValueError("函数调用不被允许")
+            elif isinstance(node, ast.Attribute):
+                raise ValueError("属性访问不被允许")
+            elif isinstance(node, ast.Subscript):
+                raise ValueError("下标访问不被允许")
+            else:
+                raise ValueError(f"不支持的AST节点: {type(node)}")
+        
+        # 检查AST安全性
+        check_node(tree)
+        
+        # 安全地编译和执行
+        code = compile(tree, '<string>', 'eval')
+        return eval(code, {"__builtins__": {}}, allowed_names)
+        
+    except SyntaxError as e:
+        raise ValueError(f"表达式语法错误: {e}")
+    except Exception as e:
+        raise ValueError(f"表达式求值失败: {e}")
+
+
     """创建计算器工具"""
 
     def calculate(expression: str) -> str:
@@ -213,18 +289,15 @@ def create_calculator_tool() -> Callable:
         try:
             # 安全的数学表达式求值
             allowed_names = {
-                "abs": abs,
-                "max": max,
-                "min": min,
-                "pow": pow,
-                "round": round,
+                "pi": 3.141592653589793,
+                "e": 2.718281828459045,
             }
 
             # 替换常见数学函数
             expression = expression.replace("^", "**")
             expression = expression.replace("sqrt", "**0.5")
 
-            result = eval(expression, {"__builtins__": {}}, allowed_names)
+            result = safe_eval(expression, allowed_names)
             return f"结果: {result}"
         except Exception as e:
             return f"计算错误: {str(e)}"
