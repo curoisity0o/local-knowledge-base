@@ -6,6 +6,7 @@
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 import logging
+import os
 
 from langchain_core.documents import Document
 
@@ -40,16 +41,13 @@ class SimpleVectorStore:
             from langchain_community.vectorstores import Chroma
 
             # 初始化嵌入模型 - 优先使用本地ModelScope模型
-            # 默认ModelScope缓存路径
-            default_model_path = (
-                "D:/code/LLM/model_cache/iic/nlp_corom_sentence-embedding_chinese-base"
-            )
+            # 使用环境变量或默认路径
+            model_cache_base = os.getenv("MODEL_CACHE_PATH", str(Path.home() / ".cache" / "models"))
+            default_model_path = Path(model_cache_base) / "iic" / "nlp_corom_sentence-embedding_chinese-base"
 
             # 检查本地模型是否存在
-            import os
-
-            if os.path.exists(default_model_path) and os.path.isdir(default_model_path):
-                model_name = default_model_path
+            if default_model_path.exists() and default_model_path.is_dir():
+                model_name = str(default_model_path)
                 logger.info(f"使用本地ModelScope嵌入模型: {model_name}")
             else:
                 # 回退到配置中的模型

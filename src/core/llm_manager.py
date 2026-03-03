@@ -5,6 +5,7 @@
 
 import os
 import time
+from pathlib import Path
 from typing import Dict, Any, Optional, List
 import logging
 from datetime import datetime
@@ -62,10 +63,10 @@ class LLMManager:
             self.local_provider = provider
 
             # 检查本地ModelScope模型路径
-            modelscope_model_path = (
-                "D:/code/LLM/model_cache/deepseek-ai/DeepSeek-V2-Lite"
-            )
-            use_modelscope = os.path.exists(modelscope_model_path)
+            # 从环境变量获取模型缓存路径，默认为用户home目录下的.cache
+            model_cache_base = os.getenv("MODEL_CACHE_PATH", str(Path.home() / ".cache" / "models"))
+            modelscope_model_path = Path(model_cache_base) / "deepseek-ai" / "DeepSeek-V2-Lite"
+            use_modelscope = modelscope_model_path.exists()
 
             if provider == "ollama":
                 # 尝试使用Ollama
