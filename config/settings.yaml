@@ -147,7 +147,7 @@ llm:
     
     ollama:
       base_url: "http://localhost:11434"
-      model: "deepseek-v2-lite:16b-q4_K_M"
+      model: "deepseek-v2:lite"
       temperature: 0.1
       context_window: 64000
       num_predict: 1024

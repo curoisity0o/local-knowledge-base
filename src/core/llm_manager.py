@@ -10,7 +10,7 @@ from typing import Dict, Any, Optional, List
 import logging
 from datetime import datetime
 
-from langchain_community.llms import Ollama
+from langchain_ollama import OllamaLLM
 from langchain_openai import ChatOpenAI
 
 # Anthropic 是可选的
@@ -64,100 +64,48 @@ class LLMManager:
 
             # 检查本地ModelScope模型路径
             # 从环境变量获取模型缓存路径，默认为用户home目录下的.cache
-            model_cache_base = os.getenv("MODEL_CACHE_PATH", str(Path.home() / ".cache" / "models"))
-            modelscope_model_path = Path(model_cache_base) / "deepseek-ai" / "DeepSeek-V2-Lite"
+            model_cache_base = os.getenv(
+                "MODEL_CACHE_PATH", str(Path.home() / ".cache" / "models")
+            )
+            modelscope_model_path = (
+                Path(model_cache_base) / "deepseek-ai" / "DeepSeek-V2-Lite"
+            )
             use_modelscope = modelscope_model_path.exists()
 
             if provider == "ollama":
-                # 尝试使用Ollama
+                # 只使用 Ollama，不回退
                 try:
-                    # 移除streaming参数，因为它在新版本中不支持
-                    self.local_llm = Ollama(
-                        base_url=get_config(
-                            "llm.local.ollama.base_url", "http://localhost:11434"
-                        ),
-                        model=get_config(
-                            "llm.local.ollama.model", "deepseek-v2-lite:16b-q4_K_M"
-                        ),
+                    # 使用新的 OllamaLLM
+                    base_url = get_config(
+                        "llm.local.ollama.base_url", "http://localhost:11434"
+                    )
+                    model = get_config("llm.local.ollama.model", "deepseek-v2:lite")
+                    logger.debug(f"Ollama配置: base_url={base_url}, model={model}")
+                    self.local_llm = OllamaLLM(
+                        base_url=base_url,
+                        model=model,
                         temperature=get_config("llm.local.ollama.temperature", 0.1),
                         num_predict=get_config("llm.local.ollama.num_predict", 1024),
                     )
-                    logger.info(
-                        f"初始化本地 Ollama 模型: {get_config('llm.local.ollama.model', 'deepseek-v2-lite:16b-q4_K_M')}"
-                    )
+                    logger.info(f"初始化本地 Ollama 模型: {model}")
                 except Exception as e:
-                    logger.warning(f"Ollama连接失败: {e}")
-                    # 回退到transformers
-                    provider = "transformers"
+                    logger.error(f"❌ Ollama 连接失败: {e}")
+                    logger.error("请确保：1. Ollama 服务已启动 (ollama serve)")
+                    logger.error(
+                        "           2. 模型已下载 (ollama pull deepseek-v2:lite)"
+                    )
+                    logger.error("           3. 服务端口 11434 可访问")
+                    # 不回退，直接标记不可用
+                    self.local_llm = None
+                    self.local_provider = None
+                    return
 
-            if provider == "transformers":
-                # 使用Transformers加载本地模型
-                try:
-                    from langchain_community.llms import HuggingFaceHub
-
-                    if use_modelscope:
-                        # 使用ModelScope下载的模型
-                        self.local_llm = HuggingFaceHub(
-                            repo_id="deepseek-ai/DeepSeek-V2-Lite",
-                            model_kwargs={
-                                "temperature": get_config("llm.local.temperature", 0.1),
-                                "max_new_tokens": get_config(
-                                    "llm.local.max_tokens", 1024
-                                ),
-                            },
-                            huggingfacehub_cache_folder=modelscope_model_path,
-                        )
-                        logger.info(f"使用ModelScope本地模型: {modelscope_model_path}")
-                    else:
-                        # 使用HuggingFace Hub
-                        self.local_llm = HuggingFaceHub(
-                            repo_id="deepseek-ai/DeepSeek-V2-Lite",
-                            model_kwargs={
-                                "temperature": get_config("llm.local.temperature", 0.1),
-                                "max_new_tokens": get_config(
-                                    "llm.local.max_tokens", 1024
-                                ),
-                            },
-                        )
-                        logger.info(
-                            "使用HuggingFace Hub模型: deepseek-ai/DeepSeek-V2-Lite"
-                        )
-
-                except ImportError:
-                    logger.warning("HuggingFaceHub不可用，尝试使用Transformers直接加载")
-                    try:
-                        from langchain_community.llms import HuggingFacePipeline
-                        from transformers import (
-                            AutoModelForCausalLM,
-                            AutoTokenizer,
-                            pipeline,
-                        )
-
-                        tokenizer = AutoTokenizer.from_pretrained(
-                            modelscope_model_path
-                            if use_modelscope
-                            else "deepseek-ai/DeepSeek-V2-Lite",
-                            trust_remote_code=True,
-                        )
-                        model = AutoModelForCausalLM.from_pretrained(
-                            modelscope_model_path
-                            if use_modelscope
-                            else "deepseek-ai/DeepSeek-V2-Lite",
-                            trust_remote_code=True,
-                            device_map="auto",
-                        )
-                        pipe = pipeline(
-                            "text-generation",
-                            model=model,
-                            tokenizer=tokenizer,
-                            max_new_tokens=1024,
-                            temperature=0.1,
-                        )
-                        self.local_llm = HuggingFacePipeline(pipeline=pipe)
-                        logger.info("使用Transformers本地模型加载成功")
-                    except Exception as te:
-                        logger.warning(f"Transformers加载失败: {te}")
-                        self.local_llm = None
+            elif provider == "transformers":
+                # transformers 已被移除，不再支持
+                logger.error("Transformers 本地模型已被移除，请使用 Ollama")
+                self.local_llm = None
+                self.local_provider = None
+                return
 
             elif provider == "vllm":
                 # TODO: 实现 vLLM 集成
@@ -261,7 +209,7 @@ class LLMManager:
                     base_url=kimi_config.get("base_url", "https://api.moonshot.cn/v1"),
                     model=kimi_config.get("model", "moonshot-v1-8k-vision-preview"),
                     temperature=kimi_config.get("temperature", 0.1),
-                    max_tokens=kimi_config.get("max_tokens", 2000),
+                    max_tokens=kimi_config.get("max_tokens", 2000),  # type: ignore[arg-type]
                 )
                 logger.info(f"初始化 Kimi 客户端: {kimi_config.get('model')}")
 

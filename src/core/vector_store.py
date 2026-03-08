@@ -36,41 +36,44 @@ class SimpleVectorStore:
             return
 
         try:
-            # 动态导入以避免启动时错误
-            from langchain_community.embeddings import HuggingFaceEmbeddings
-            from langchain_community.vectorstores import Chroma
-
-            # 初始化嵌入模型 - 优先使用本地ModelScope模型
-            # 使用环境变量或默认路径
-            model_cache_base = os.getenv("MODEL_CACHE_PATH", str(Path.home() / ".cache" / "models"))
-            default_model_path = Path(model_cache_base) / "iic" / "nlp_corom_sentence-embedding_chinese-base"
-
-            # 检查本地模型是否存在
-            if default_model_path.exists() and default_model_path.is_dir():
-                model_name = str(default_model_path)
-                logger.info(f"使用本地ModelScope嵌入模型: {model_name}")
-            else:
-                # 回退到配置中的模型
-                model_name = get_config("embeddings.model", "BAAI/bge-m3")
-                logger.info(f"使用配置嵌入模型: {model_name}")
-
-            device = get_config("embeddings.device", "cpu")
-            normalize_embeddings = get_config("embeddings.normalize_embeddings", True)
-            batch_size = get_config("embeddings.batch_size", 32)
-
-            logger.info(f"初始化嵌入模型: {model_name}, 设备: {device}")
-
-            self.embedder = HuggingFaceEmbeddings(
-                model_name=model_name,
-                model_kwargs={"device": device},
-                encode_kwargs={
-                    "normalize_embeddings": normalize_embeddings,
-                    "batch_size": batch_size,
-                },
-            )
+            # 强制使用 Ollama 嵌入模型（本地运行，速度快）
+            # 读取配置，优先使用 Ollama
+            
+            # 尝试加载 Ollama 嵌入
+            try:
+                # 先尝试新版本
+                try:
+                    from langchain_ollama import OllamaEmbeddings
+                except ImportError:
+                    from langchain_community.embeddings import OllamaEmbeddings
+                
+                # 获取模型名称
+                ollama_model = get_config("embeddings.ollama_model", "bge-m3")
+                if not ollama_model:
+                    ollama_model = os.getenv("EMBEDDINGS_OLLAMA_MODEL", "bge-m3")
+                
+                logger.info(f"使用 Ollama 嵌入模型: {ollama_model}")
+                
+                self.embedder = OllamaEmbeddings(
+                    model=ollama_model,
+                    base_url="http://localhost:11434"
+                )
+                self._using_ollama = True
+                logger.info("Ollama 嵌入模型初始化成功")
+                
+            except Exception as e:
+                logger.error(f"Ollama 嵌入模型初始化失败: {e}")
+                logger.error("请确保 Ollama 服务正在运行: ollama serve")
+                logger.error("请确保已下载嵌入模型: ollama pull bge-m3")
+                raise RuntimeError(f"无法初始化 Ollama 嵌入模型: {e}")
 
             # 初始化向量存储
             if self.store_type == "chroma":
+                try:
+                    from langchain_chroma import Chroma
+                except ImportError:
+                    from langchain_community.vectorstores import Chroma
+                
                 persist_directory = get_config(
                     "vector_store.chroma.persist_directory",
                     "./data/vector_store/chroma",
@@ -168,7 +171,7 @@ class SimpleVectorStore:
 
         info = {
             "store_type": self.store_type,
-            "embedding_model": self.embedder.model_name if self.embedder else "unknown",
+            "embedding_model": "ollama" if hasattr(self, '_using_ollama') else "huggingface",
             "status": "initialized" if self._initialized else "not_initialized",
         }
 

@@ -1,10 +1,12 @@
 # 本地知识库系统 (Local Knowledge Base System)
 
-基于 LangChain + RAG + Agent 架构的本地化知识库系统，支持 DeepSeek-V2-Lite 本地模型和大模型 API 混合模式。
+基于 LangChain + RAG + Agent 架构的本地化知识库系统，支持本地模型和云 API 双模式。
 
 ## ✨ 特性
 
-- **双模式LLM支持**: 本地 DeepSeek-V2-Lite (MoE 16B 4-bit) + 云API后备 (OpenAI/DeepSeek/Anthropic)
+- **双模式LLM支持**: 
+  - 本地模式：Ollama 模型 (DeepSeek-V2-Lite / Qwen2.5-7B)
+  - API 模式：OpenAI / DeepSeek / Kimi / Anthropic
 - **完整RAG流水线**: 文档加载 → 文本分割 → 向量化 → 检索 → 增强生成
 - **智能Agent系统**: 基于 LangGraph 的多工具 Agent，支持复杂任务分解
 - **多格式文档支持**: PDF, DOCX, TXT, Markdown, 网页等
@@ -20,10 +22,9 @@
 - **ChromaDB**: 向量数据库 (本地轻量)
 
 ### 模型
-- **本地LLM**: DeepSeek-V2-Lite 16B (4-bit量化 via Ollama)
-- **备选本地**: Qwen2.5-7B (4-bit量化)
-- **嵌入模型**: BGE-M3 (中文优化) / Nomic Embed Text
-- **API后备**: OpenAI GPT-4o, DeepSeek API, Claude
+- **本地LLM**: Ollama 管理 (DeepSeek-V2-Lite / Qwen2.5-7B)
+- **嵌入模型**: Ollama bge-m3 (中文优化)
+- **API**: OpenAI GPT-4o, DeepSeek, Kimi (Moonshot), Anthropic Claude
 
 ### 前端 & API
 - **Streamlit**: 快速原型 Web 界面
@@ -51,11 +52,13 @@ pip install -r requirements.txt
 # 安装 Ollama (管理本地模型)
 # 访问 https://ollama.ai/ 下载安装
 
-# 拉取 DeepSeek-V2-Lite 模型
-ollama pull deepseek-v2-lite:16b-q4_K_M
+# 拉取 LLM 模型 (选择其一)
+ollama pull deepseek-v2:lite
+# 或
+ollama pull qwen2.5:7b
 
 # 拉取嵌入模型
-ollama pull bge-m3  # 或使用 transformers 加载
+ollama pull bge-m3
 ```
 
 ### 2. 配置环境
@@ -64,25 +67,30 @@ ollama pull bge-m3  # 或使用 transformers 加载
 # 复制环境变量示例
 cp .env.example .env
 
-# 编辑 .env 文件，配置您的 API 密钥和路径
-# 如需使用 API 后备，填写 OPENAI_API_KEY 等
+# 编辑 .env 文件，配置 API 密钥（可选）
+# API 模式需要: OPENAI_API_KEY / DEEPSEEK_API_KEY 等
 ```
 
 ### 3. 启动服务
 
 ```bash
-# 启动 API 服务
+# 终端1: 启动 Ollama (如使用本地模式)
+ollama serve
+
+# 终端2: 启动 API 服务
 python src/api/main.py
 
-# 启动 Streamlit 前端 (新终端)
+# 终端3: 启动 Streamlit 前端
 streamlit run src/frontend/app.py
 ```
 
-### 4. 导入文档
+### 4. 使用界面
 
-1. 将文档放入 `data/raw_docs/` 目录
-2. 通过 Web 界面或 API 触发文档处理
-3. 开始问答交互
+1. 打开浏览器访问 http://localhost:8501
+2. 选择模式：**local** (本地 Ollama) 或 **api** (云 API)
+3. 上传文档到 `data/raw_docs/` 目录
+4. 点击"处理文档"按钮
+5. 开始问答
 
 ## 📁 项目结构
 
@@ -140,20 +148,28 @@ local-knowledge-base/
 - ChromaDB: 2-4GB 内存
 - 应用框架: 1-2GB 内存
 
-## 🔧 配置说明
+## ⚙️ 配置说明
 
-### 模型切换
-在 `.env` 文件中修改：
-```bash
-# 使用本地模型
-LOCAL_MODEL_NAME="deepseek-v2-lite:16b-q4_K_M"
+### 模型模式选择
 
-# 或切换到 Qwen
-# LOCAL_MODEL_NAME="qwen2.5:7b-instruct-q4_K_M"
+界面选择（frontend/app.py）：
+- **local**: 使用本地 Ollama 模型
+- **api**: 使用云 API (需要配置 API Key)
 
-# 启用API后备
-OPENAI_API_KEY="your-key-here"
-USE_API_FALLBACK=true
+### 配置文件 (config/settings.yaml)
+
+```yaml
+llm:
+  local:
+    provider: "ollama"  # 只支持 ollama
+    ollama:
+      base_url: "http://localhost:11434"
+      model: "deepseek-v2:lite"  # 或 qwen2.5:7b
+      
+  api:
+    enabled: true
+    # 配置 API Key（通过环境变量）
+    # OPENAI_API_KEY, DEEPSEEK_API_KEY, KIMI_API_KEY 等
 ```
 
 ### RAG 参数调优
@@ -164,7 +180,6 @@ rag:
   chunk_overlap: 100       # 重叠字符数
   retrieval_top_k: 4       # 检索文档数量
   score_threshold: 0.7     # 相似度阈值
-  enable_reranking: true   # 启用重排序
 ```
 
 ## 🤖 Agent 系统
@@ -190,14 +205,28 @@ rag:
 ## 🔌 API 接口
 
 ### REST API 端点
+- `GET /health` - 快速健康检查（不初始化组件）
+- `GET /health/local` - 检查本地模型状态
+- `GET /health/api` - 检查 API 状态
+- `GET /health/vectorstore` - 检查向量存储状态
+- `GET /health/detailed` - 详细健康检查
+- `POST /api/v1/query` - 知识库问答 (支持 provider 参数: local/api)
 - `POST /api/v1/documents/upload` - 上传文档
 - `POST /api/v1/documents/process` - 处理文档
-- `POST /api/v1/query` - 知识库问答
-- `POST /api/v1/chat` - 对话式问答
-- `GET /api/v1/status` - 系统状态
+- `POST /api/v1/models/warmup` - 预热模型
 
-### WebSocket 接口
-- `/ws/chat` - 实时聊天流式传输
+### 查询参数
+```bash
+# 使用本地模型
+curl -X POST http://localhost:8000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{"question": "你的问题", "provider": "local"}'
+
+# 使用 API
+curl -X POST http://localhost:8000/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{"question": "你的问题", "provider": "api"}'
+```
 
 ## 🧪 测试
 
@@ -217,6 +246,28 @@ python scripts/benchmark.py
 - 日志文件: `logs/app.log`
 - 性能监控: Prometheus metrics on `/metrics`
 - 健康检查: `/health`
+
+## 📋 更新记录
+
+详细更新内容请查看 [CHANGELOG.md](./CHANGELOG.md)
+
+### 最新更新 (2026-03-09)
+
+#### 功能变更
+- 🔄 **简化双模式**: 移除 auto 模式，只保留 **local** 和 **api** 两选项
+- 🗑️ **移除 Transformers**: 本地模型只支持 Ollama，不再回退到 HuggingFace
+- 🔌 **独立健康检查**: 新增 `/health/local`、`/health/api`、`/health/vectorstore` 端点
+- 📝 **引用去重**: 修复同一文档多次引用的问题
+
+#### 配置变更
+- 本地模式：`provider = "ollama"` (config/settings.yaml)
+- API 模式：配置 OPENAI_API_KEY / DEEPSEEK_API_KEY 等
+
+### 历史更新 (2026-03-08)
+- 🐛 修复本地模型初始化Bug - `src/core/llm_manager.py` 第98行条件分支逻辑错误
+- ✅ 系统组件全面验证通过
+- ✅ Ollama服务连接正常
+- ✅ API服务器启动正常
 
 ## 🤝 贡献
 
