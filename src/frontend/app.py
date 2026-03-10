@@ -546,7 +546,153 @@ def render_chat_interface():
                             st.markdown(error_msg)
 
 
-# 系统信息
+# 文档管理界面
+def render_document_management():
+    """渲染文档管理界面（包含列表、统计、删除功能）"""
+    import requests
+    import pandas as pd
+
+    with st.container():
+        st.markdown("### 📊 文档统计")
+
+        # 获取统计信息
+        try:
+            response = requests.get(
+                "http://localhost:8000/api/v1/documents/stats",
+                timeout=10
+            )
+            if response.status_code == 200:
+                stats = response.json()
+
+                # 显示统计指标
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("文档总数", stats.get("total_documents", 0))
+                with col2:
+                    st.metric("已索引", stats.get("indexed_documents", 0))
+                with col3:
+                    st.metric("未索引", stats.get("not_indexed_documents", 0))
+                with col4:
+                    total_size_mb = stats.get("total_size", 0) / (1024 * 1024)
+                    st.metric("总大小", f"{total_size_mb:.2f} MB")
+            else:
+                st.warning("无法获取文档统计")
+        except Exception as e:
+            st.error(f"获取统计失败: {e}")
+
+        st.markdown("---")
+
+        # 刷新按钮
+        col1, col2 = st.columns([6, 1])
+        with col2:
+            if st.button("🔄 刷新", key="refresh_docs"):
+                st.rerun()
+
+        # 获取文档列表
+        try:
+            response = requests.get(
+                "http://localhost:8000/api/v1/documents/list",
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                documents = data.get("documents", [])
+
+                if not documents:
+                    st.info("暂无文档，请先上传文档")
+                    return
+
+                # 准备表格数据
+                doc_data = []
+                for doc in documents:
+                    size_kb = doc.get("file_size", 0) / 1024
+                    size_str = f"{size_kb:.2f} KB" if size_kb < 1024 else f"{size_kb/1024:.2f} MB"
+
+                    # 处理修改时间
+                    modified_time = doc.get("modified_time")
+                    if modified_time:
+                        from datetime import datetime
+                        mod_time = datetime.fromtimestamp(modified_time)
+                        mod_time_str = mod_time.strftime("%Y-%m-%d %H:%M")
+                    else:
+                        mod_time_str = "未知"
+
+                    doc_data.append({
+                        "文件名": doc.get("filename", ""),
+                        "大小": size_str,
+                        "格式": doc.get("file_extension", ""),
+                        "修改时间": mod_time_str,
+                        "向量状态": doc.get("vector_status", "not_indexed"),
+                        "Chunks": doc.get("chunks_count", 0),
+                        "文件路径": doc.get("file_path", "")
+                    })
+
+                # 创建 DataFrame
+                df = pd.DataFrame(doc_data)
+
+                # 显示表格
+                st.markdown("### 📁 文档列表")
+
+                # 格式化向量状态显示
+                def format_vector_status(status):
+                    if status == "indexed":
+                        return "✅ 已索引"
+                    return "❌ 未索引"
+
+                df["向量状态"] = df["向量状态"].apply(format_vector_status)
+
+                # 使用 Streamlit 的 data_editor 实现可交互表格
+                edited_df = st.dataframe(
+                    df[["文件名", "大小", "格式", "修改时间", "向量状态", "Chunks"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                # 删除功能
+                st.markdown("### 🗑️ 删除文档")
+
+                # 选择要删除的文档 - 添加默认选项
+                filenames = ["请选择..."] + df["文件名"].tolist()
+                if len(filenames) > 1:
+                    selected_file = st.selectbox(
+                        "选择要删除的文档",
+                        filenames,
+                        key="delete_file_select"
+                    )
+
+                    # 只有选择了具体文档后才显示删除确认
+                    if selected_file and selected_file != "请选择...":
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.warning(f"⚠️ 确定要删除文档 **'{selected_file}'** 吗？此操作不可恢复！")
+                        with col2:
+                            if st.button("🗑️ 确认删除", key=f"delete_{selected_file}"):
+                                try:
+                                    delete_response = requests.delete(
+                                        f"http://localhost:8000/api/v1/documents/{selected_file}",
+                                        timeout=10
+                                    )
+
+                                    if delete_response.status_code == 200:
+                                        result = delete_response.json()
+                                        if result.get("success"):
+                                            st.success(f"✅ {result.get('message', '删除成功')}")
+                                            # 刷新页面
+                                            st.rerun()
+                                        else:
+                                            st.error(f"❌ {result.get('message', '删除失败')}")
+                                    else:
+                                        st.error(f"❌ 删除失败: {delete_response.status_code}")
+                                except Exception as e:
+                                    st.error(f"❌ 删除失败: {e}")
+                    elif selected_file == "请选择...":
+                        st.info("请从上方选择一个文档进行删除")
+            else:
+                st.error(f"获取文档列表失败: {response.status_code}")
+
+        except Exception as e:
+            st.error(f"加载文档列表失败: {e}")
 def render_system_info():
     """渲染系统信息"""
     with st.expander("🔧 系统信息", expanded=False):
@@ -599,6 +745,11 @@ def main():
     tab1, tab2, tab3 = st.tabs(["📄 文档管理", "💬 智能问答", "🔧 系统设置"])
 
     with tab1:
+        # 新增：文档管理界面
+        render_document_management()
+        # 保留原有上传功能
+        st.markdown("---")
+        st.markdown("### 📤 文档上传")
         render_document_upload()
 
     with tab2:

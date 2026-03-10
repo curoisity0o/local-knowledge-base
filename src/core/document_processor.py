@@ -66,6 +66,7 @@ class DocumentProcessor:
         )
         
         # 支持的格式和对应的加载器
+        # self.config 是 get_config("document_processing", {}) 返回的字典
         self.supported_formats = self.config.get("supported_formats", [])
         self.loader_mapping = self._create_loader_mapping()
     

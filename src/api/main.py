@@ -113,6 +113,44 @@ class HealthResponse(BaseModel):
     version: str
 
 
+# 文档管理模型
+class DocumentInfo(BaseModel):
+    """文档信息"""
+    filename: str
+    file_path: str
+    file_size: int
+    modified_time: Optional[float] = None
+    file_extension: str
+    chunks_count: int = 0
+    vector_status: str = "not_indexed"  # "indexed" 或 "not_indexed"
+
+
+class DocumentListResponse(BaseModel):
+    """文档列表响应"""
+    documents: List[DocumentInfo]
+    total: int
+    indexed_count: int
+    not_indexed_count: int
+
+
+class DocumentDeleteResponse(BaseModel):
+    """文档删除响应"""
+    success: bool
+    message: str
+    file_deleted: bool = False
+    vectors_deleted: bool = False
+    error: Optional[str] = None
+
+
+class DocumentStatsResponse(BaseModel):
+    """文档统计响应"""
+    total_documents: int
+    indexed_documents: int
+    not_indexed_documents: int
+    total_size: int
+    average_chunks: float
+
+
 # API 端点
 @app.get("/")
 async def root():
@@ -127,6 +165,9 @@ async def root():
             "upload": "/api/v1/documents/upload (POST)",
             "process": "/api/v1/documents/process (POST)",
             "stats": "/api/v1/stats (GET)",
+            "document_list": "/api/v1/documents/list (GET)",
+            "document_delete": "/api/v1/documents/{filename} (DELETE)",
+            "document_stats": "/api/v1/documents/stats (GET)",
         },
     }
 
@@ -383,9 +424,17 @@ async def upload_document(file: UploadFile = File(...)):
 async def process_documents(request: DocumentProcessRequest):
     """处理文档（添加到向量存储）"""
     try:
+        import os
+        from pathlib import Path
+
         processor = get_processor()
         vector_store = get_vector_store()
+        
+        # 初始化变量
+        skipped_docs = []
+        documents = []
 
+        # 获取默认目录 - 使用绝对路径确保 API 和前端路径一致
         if request.process_directory and request.file_path:
             # 处理整个目录
             documents = processor.process_directory(request.file_path)
@@ -393,9 +442,57 @@ async def process_documents(request: DocumentProcessRequest):
             # 处理单个文件
             documents = processor.process_file(request.file_path)
         else:
-            # 处理默认目录
-            default_dir = config.get("paths.raw_docs", "./data/raw_docs")
-            documents = processor.process_directory(default_dir)
+            # 处理默认目录 - 使用绝对路径
+            raw_docs_dir = config.get("paths.raw_docs", "./data/raw_docs")
+            # 转换为绝对路径
+            if not os.path.isabs(raw_docs_dir):
+                # 基于项目根目录
+                project_root = Path(__file__).parent.parent.parent
+                raw_docs_dir = str(project_root / raw_docs_dir)
+
+            # 确保目录存在
+            Path(raw_docs_dir).mkdir(parents=True, exist_ok=True)
+
+            logger.info(f"处理文档目录: {raw_docs_dir}")
+
+            # 获取向量存储中已存在的源文件
+            indexed_sources = set()
+            try:
+                all_sources = vector_store.get_all_sources()
+                indexed_sources = set(all_sources)
+                logger.info(f"已索引的文档: {indexed_sources}")
+            except Exception as e:
+                logger.warning(f"获取已索引文档失败: {e}")
+
+            # 加载所有文档
+            all_docs = processor.load_documents_from_directory(raw_docs_dir)
+            logger.info(f"加载了 {len(all_docs)} 个原始文档")
+
+            # 过滤掉已存在的文档
+            new_docs = []
+            skipped_docs = []
+            for doc in all_docs:
+                source = doc.metadata.get("source", "")
+                if source in indexed_sources:
+                    skipped_docs.append(source)
+                    logger.info(f"跳过已存在的文档: {source}")
+                else:
+                    new_docs.append(doc)
+
+            logger.info(f"新文档: {len(new_docs)}, 跳过: {len(skipped_docs)}")
+
+            # 如果有新文档，处理它们
+            if new_docs:
+                # 预处理
+                for doc in new_docs:
+                    doc.page_content = processor.preprocess_text(doc.page_content)
+                
+                # 分割
+                documents = processor.split_documents(new_docs)
+                logger.info(f"生成了 {len(documents)} 个 chunks")
+            else:
+                documents = []
+                logger.info("没有新文档需要处理")
 
         # 添加到向量存储
         if documents:
@@ -406,9 +503,19 @@ async def process_documents(request: DocumentProcessRequest):
                 message=f"成功处理 {len(documents)} 个文档块",
                 chunks_count=len(documents),
             )
-        else:
+        elif skipped_docs:
+            # 全部已存在
             return DocumentProcessResponse(
-                success=False, message="未找到可处理的文档", chunks_count=0
+                success=True,
+                message=f"所有文档已存在，无需重复处理",
+                chunks_count=0,
+            )
+        else:
+            # 没有文档
+            return DocumentProcessResponse(
+                success=False,
+                message="未找到可处理的文档",
+                chunks_count=0
             )
 
     except Exception as e:
@@ -447,6 +554,299 @@ async def get_system_stats():
     except Exception as e:
         logger.error(f"获取统计信息失败: {e}")
         raise HTTPException(status_code=500, detail=f"获取统计信息失败: {str(e)}")
+
+
+@app.get("/api/v1/documents/list", response_model=DocumentListResponse)
+async def list_documents():
+    """获取文档列表
+
+    返回所有已上传文档的列表，包括文件名、路径、大小、修改时间、格式、
+    chunks 数量和向量索引状态。
+
+    Returns:
+        DocumentListResponse: 包含文档列表和统计信息
+
+    Raises:
+        HTTPException: 获取文档列表失败时抛出 500 错误
+    """
+    try:
+        import os
+        from pathlib import Path
+
+        # 获取原始文档目录 - 使用绝对路径
+        raw_docs_dir = config.get("paths.raw_docs", "./data/raw_docs")
+        # 转换为绝对路径
+        if not os.path.isabs(raw_docs_dir):
+            project_root = Path(__file__).parent.parent.parent
+            raw_docs_dir = str(project_root / raw_docs_dir)
+
+        raw_docs_path = Path(raw_docs_dir)
+
+        # 如果目录不存在，返回空列表
+        if not raw_docs_path.exists():
+            return DocumentListResponse(
+                documents=[],
+                total=0,
+                indexed_count=0,
+                not_indexed_count=0
+            )
+
+        # 获取向量存储中所有已索引的源文件
+        vector_store = get_vector_store()
+        indexed_sources = set()
+        source_chunks_count = {}
+
+        try:
+            all_sources = vector_store.get_all_sources()
+            indexed_sources = set(all_sources)
+
+            # 统计每个源文件的 chunks 数量
+            for source in all_sources:
+                docs = vector_store.get_documents_by_source(source)
+                source_chunks_count[source] = len(docs)
+        except Exception as e:
+            logger.warning(f"获取向量存储信息失败: {e}")
+
+        # 遍历目录获取文件列表
+        documents = []
+        indexed_count = 0
+        not_indexed_count = 0
+
+        for file_path in raw_docs_path.iterdir():
+            if file_path.is_file():
+                # 获取文件信息
+                stat = file_path.stat()
+                filename = file_path.name
+                file_ext = file_path.suffix.lower()
+
+                # 检查是否已索引
+                source_path = str(file_path.resolve())
+                is_indexed = source_path in indexed_sources
+                chunks_count = source_chunks_count.get(source_path, 0)
+
+                if is_indexed:
+                    indexed_count += 1
+                    vector_status = "indexed"
+                else:
+                    not_indexed_count += 1
+                    vector_status = "not_indexed"
+
+                doc_info = DocumentInfo(
+                    filename=filename,
+                    file_path=source_path,
+                    file_size=stat.st_size,
+                    modified_time=stat.st_mtime,
+                    file_extension=file_ext,
+                    chunks_count=chunks_count,
+                    vector_status=vector_status
+                )
+                documents.append(doc_info)
+
+        # 按修改时间排序（最新的在前）
+        documents.sort(key=lambda x: x.modified_time or 0, reverse=True)
+
+        return DocumentListResponse(
+            documents=documents,
+            total=len(documents),
+            indexed_count=indexed_count,
+            not_indexed_count=not_indexed_count
+        )
+
+    except Exception as e:
+        logger.error(f"获取文档列表失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取文档列表失败: {str(e)}")
+
+
+@app.delete("/api/v1/documents/{filename}", response_model=DocumentDeleteResponse)
+async def delete_document(filename: str):
+    """删除文档及其向量（原子操作）
+
+    删除操作遵循以下步骤：
+    1. 首先删除向量存储中的向量
+    2. 然后删除物理文件
+    如果向量删除失败，操作将回滚（文件不会被删除）
+    如果文件删除失败，向量也已被删除，不会再恢复
+    """
+    try:
+        from pathlib import Path
+        import shutil
+
+        # 获取原始文档目录 - 使用绝对路径
+        raw_docs_dir = config.get("paths.raw_docs", "./data/raw_docs")
+        # 转换为绝对路径
+        if not os.path.isabs(raw_docs_dir):
+            project_root = Path(__file__).parent.parent.parent
+            raw_docs_dir = str(project_root / raw_docs_dir)
+
+        raw_docs_path = Path(raw_docs_dir)
+
+        # 查找文件
+        file_path = raw_docs_path / filename
+
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail=f"文件不存在: {filename}")
+
+        # 获取文件的绝对路径（用于向量存储匹配）
+        absolute_path = str(file_path.resolve())
+
+        # 步骤1：先尝试删除向量
+        vector_store = get_vector_store()
+        vectors_deleted = False
+        vector_delete_error = None
+
+        try:
+            vectors_deleted = vector_store.delete_by_source(absolute_path)
+            logger.info(f"向量删除结果: {vectors_deleted}, 文件: {absolute_path}")
+        except Exception as e:
+            vector_delete_error = str(e)
+            logger.error(f"删除向量失败: {e}")
+
+        # 如果向量删除失败，尝试再次删除（处理并发情况）
+        if not vectors_deleted and vector_delete_error:
+            try:
+                vectors_deleted = vector_store.delete_by_source(absolute_path)
+            except Exception as e2:
+                logger.warning(f"重试删除向量失败: {e2}")
+
+        # 步骤2：删除物理文件
+        file_deleted = False
+        file_delete_error = None
+
+        try:
+            # 如果是目录，则删除整个目录；如果是文件，则删除文件
+            if file_path.is_dir():
+                shutil.rmtree(file_path)
+            else:
+                file_path.unlink()
+            file_deleted = True
+            logger.info(f"文件删除成功: {file_path}")
+        except Exception as e:
+            file_delete_error = str(e)
+            logger.error(f"删除文件失败: {e}")
+
+        # 返回结果
+        if file_deleted:
+            return DocumentDeleteResponse(
+                success=True,
+                message=f"文档 {filename} 已成功删除",
+                file_deleted=True,
+                vectors_deleted=vectors_deleted,
+                error=None
+            )
+        else:
+            # 文件删除失败
+            return DocumentDeleteResponse(
+                success=False,
+                message=f"删除文档失败: {file_delete_error}",
+                file_deleted=False,
+                vectors_deleted=vectors_deleted,  # 向量可能已删除
+                error=file_delete_error
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"删除文档时发生错误: {e}")
+        return DocumentDeleteResponse(
+            success=False,
+            message=f"删除文档失败: {str(e)}",
+            file_deleted=False,
+            vectors_deleted=False,
+            error=str(e)
+        )
+
+
+@app.get("/api/v1/documents/stats", response_model=DocumentStatsResponse)
+async def get_document_stats():
+    """获取文档统计信息
+
+    返回文档统计信息，包括：
+    - total_documents: 文档总数
+    - indexed_documents: 已索引文档数
+    - not_indexed_documents: 未索引文档数
+    - total_size: 文档总大小（字节）
+    - average_chunks: 平均每个文档的 chunks 数量
+
+    Returns:
+        DocumentStatsResponse: 包含文档统计信息
+
+    Raises:
+        HTTPException: 获取统计信息失败时抛出 500 错误
+    """
+    try:
+        import os
+        from pathlib import Path
+
+        # 获取原始文档目录 - 使用绝对路径
+        raw_docs_dir = config.get("paths.raw_docs", "./data/raw_docs")
+        # 转换为绝对路径
+        if not os.path.isabs(raw_docs_dir):
+            project_root = Path(__file__).parent.parent.parent
+            raw_docs_dir = str(project_root / raw_docs_dir)
+
+        raw_docs_path = Path(raw_docs_dir)
+
+        # 如果目录不存在，返回零值统计
+        if not raw_docs_path.exists():
+            return DocumentStatsResponse(
+                total_documents=0,
+                indexed_documents=0,
+                not_indexed_documents=0,
+                total_size=0,
+                average_chunks=0.0
+            )
+
+        # 获取向量存储信息
+        vector_store = get_vector_store()
+        indexed_sources = set()
+        source_chunks_count = {}
+
+        try:
+            all_sources = vector_store.get_all_sources()
+            indexed_sources = set(all_sources)
+
+            #文件的 chunks 数量 统计每个源
+            for source in all_sources:
+                docs = vector_store.get_documents_by_source(source)
+                source_chunks_count[source] = len(docs)
+        except Exception as e:
+            logger.warning(f"获取向量存储信息失败: {e}")
+
+        # 统计文件信息
+        total_docs = 0
+        indexed_count = 0
+        not_indexed_count = 0
+        total_size = 0
+        total_chunks = 0
+
+        for file_path in raw_docs_path.iterdir():
+            if file_path.is_file():
+                total_docs += 1
+                stat = file_path.stat()
+                total_size += stat.st_size
+
+                # 检查是否已索引
+                source_path = str(file_path.resolve())
+                if source_path in indexed_sources:
+                    indexed_count += 1
+                    total_chunks += source_chunks_count.get(source_path, 0)
+                else:
+                    not_indexed_count += 1
+
+        # 计算平均 chunks 数
+        average_chunks = total_chunks / indexed_count if indexed_count > 0 else 0.0
+
+        return DocumentStatsResponse(
+            total_documents=total_docs,
+            indexed_documents=indexed_count,
+            not_indexed_documents=not_indexed_count,
+            total_size=total_size,
+            average_chunks=round(average_chunks, 2)
+        )
+
+    except Exception as e:
+        logger.error(f"获取文档统计失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取文档统计失败: {str(e)}")
 
 
 @app.get("/api/v1/models/available")

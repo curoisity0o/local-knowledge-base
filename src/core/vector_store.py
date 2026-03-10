@@ -188,6 +188,113 @@ class SimpleVectorStore:
 
         return info
 
+    def get_documents_by_source(self, source_path: str) -> List[Document]:
+        """根据源文件路径获取文档
+
+        Args:
+            source_path: 源文件路径
+
+        Returns:
+            匹配的文档列表
+        """
+        self._ensure_initialized()
+
+        if self.vector_store is None:
+            logger.error("向量存储未正确初始化")
+            return []
+
+        try:
+            # 使用 ChromaDB 的 get 方法按 source 元数据查询
+            if hasattr(self.vector_store, "_collection"):
+                collection = self.vector_store._collection
+                results = collection.get(where={"source": source_path})
+
+                if results and results.get("documents"):
+                    documents_list = results["documents"]
+                    if documents_list:
+                        documents = []
+                        metadatas = results.get("metadatas") or []
+                        for i, content in enumerate(documents_list):
+                            metadata = metadatas[i] if i < len(metadatas) else {}
+                            doc = Document(
+                                page_content=content,
+                                metadata=metadata
+                            )
+                            documents.append(doc)
+                        return documents
+            return []
+        except Exception as e:
+            logger.error(f"根据源路径获取文档失败: {e}")
+            return []
+
+    def delete_by_source(self, source_path: str) -> bool:
+        """根据源文件路径删除向量
+
+        Args:
+            source_path: 源文件路径
+
+        Returns:
+            是否删除成功
+        """
+        self._ensure_initialized()
+
+        if self.vector_store is None:
+            logger.error("向量存储未正确初始化")
+            return False
+
+        try:
+            # 使用 ChromaDB 的 delete 方法按 source 元数据删除
+            if hasattr(self.vector_store, "_collection"):
+                collection = self.vector_store._collection
+                # 获取要删除的文档 IDs
+                results = collection.get(where={"source": source_path})
+
+                if results and results.get("ids"):
+                    ids_to_delete = results["ids"]
+                    collection.delete(ids=ids_to_delete)
+                    logger.info(f"成功删除 {len(ids_to_delete)} 个向量: {source_path}")
+                    return True
+                else:
+                    logger.info(f"未找到要删除的向量: {source_path}")
+                    # 没有找到向量也返回成功（幂等性）
+                    return True
+            else:
+                logger.error("向量存储不支持 _collection 访问")
+                return False
+        except Exception as e:
+            logger.error(f"删除向量失败: {e}")
+            return False
+
+    def get_all_sources(self) -> List[str]:
+        """获取所有已索引的源文件路径（去重）
+
+        Returns:
+            源文件路径列表
+        """
+        self._ensure_initialized()
+
+        if self.vector_store is None:
+            logger.error("向量存储未正确初始化")
+            return []
+
+        try:
+            if hasattr(self.vector_store, "_collection"):
+                collection = self.vector_store._collection
+                # 获取所有文档的元数据
+                results = collection.get()
+
+                if results:
+                    metadatas = results.get("metadatas") or []
+                    sources = set()
+                    for metadata in metadatas:
+                        if metadata and "source" in metadata:
+                            sources.add(metadata["source"])
+                    return list(sources)
+            return []
+        except Exception as e:
+            logger.error(f"获取所有源文件路径失败: {e}")
+            return []
+
 
 # 便捷函数
 def create_vector_store(config=None) -> SimpleVectorStore:
