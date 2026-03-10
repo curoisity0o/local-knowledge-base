@@ -658,14 +658,16 @@ async def list_documents():
 
 
 @app.delete("/api/v1/documents/{filename}", response_model=DocumentDeleteResponse)
-async def delete_document(filename: str):
+async def delete_document(filename: str, delete_file: bool = True):
     """删除文档及其向量（原子操作）
 
-    删除操作遵循以下步骤：
-    1. 首先删除向量存储中的向量
-    2. 然后删除物理文件
-    如果向量删除失败，操作将回滚（文件不会被删除）
-    如果文件删除失败，向量也已被删除，不会再恢复
+    删除操作：
+    - 默认：删除向量存储中的向量 AND 物理文件
+    - delete_file=false：只删除向量，保留源文件（用于重新索引）
+
+    Args:
+        filename: 要删除的文件名
+        delete_file: 是否同时删除物理文件，默认True
     """
     try:
         from pathlib import Path
@@ -684,12 +686,15 @@ async def delete_document(filename: str):
         file_path = raw_docs_path / filename
 
         if not file_path.exists():
-            raise HTTPException(status_code=404, detail=f"文件不存在: {filename}")
+            # 如果文件不存在但用户想删除向量，仍然继续
+            if not delete_file:
+                raise HTTPException(status_code=404, detail=f"文件不存在: {filename}")
+            logger.warning(f"文件不存在: {filename}")
 
         # 获取文件的绝对路径（用于向量存储匹配）
         absolute_path = str(file_path.resolve())
 
-        # 步骤1：先尝试删除向量
+        # 步骤1：删除向量
         vector_store = get_vector_store()
         vectors_deleted = False
         vector_delete_error = None
@@ -708,29 +713,51 @@ async def delete_document(filename: str):
             except Exception as e2:
                 logger.warning(f"重试删除向量失败: {e2}")
 
-        # 步骤2：删除物理文件
+        # 步骤2：删除物理文件（如果 delete_file=True）
         file_deleted = False
         file_delete_error = None
 
-        try:
-            # 如果是目录，则删除整个目录；如果是文件，则删除文件
-            if file_path.is_dir():
-                shutil.rmtree(file_path)
-            else:
-                file_path.unlink()
-            file_deleted = True
-            logger.info(f"文件删除成功: {file_path}")
-        except Exception as e:
-            file_delete_error = str(e)
-            logger.error(f"删除文件失败: {e}")
+        if delete_file and file_path.exists():
+            try:
+                # 如果是目录，则删除整个目录；如果是文件，则删除文件
+                if file_path.is_dir():
+                    shutil.rmtree(file_path)
+                else:
+                    file_path.unlink()
+                file_deleted = True
+                logger.info(f"文件删除成功: {file_path}")
+            except Exception as e:
+                file_delete_error = str(e)
+                logger.error(f"删除文件失败: {e}")
+        elif not delete_file:
+            logger.info(f"保留源文件（delete_file=False）: {file_path}")
+            file_deleted = True  # 视为成功
 
         # 返回结果
         if file_deleted:
+            if delete_file:
+                return DocumentDeleteResponse(
+                    success=True,
+                    message=f"文档 {filename} 已成功删除（向量+源文件）",
+                    file_deleted=True,
+                    vectors_deleted=vectors_deleted,
+                    error=None
+                )
+            else:
+                return DocumentDeleteResponse(
+                    success=True,
+                    message=f"向量已删除，源文件保留: {filename}",
+                    file_deleted=False,
+                    vectors_deleted=vectors_deleted,
+                    error=None
+                )
+        elif vectors_deleted:
+            # 只有向量删除成功
             return DocumentDeleteResponse(
                 success=True,
-                message=f"文档 {filename} 已成功删除",
-                file_deleted=True,
-                vectors_deleted=vectors_deleted,
+                message=f"向量已删除: {filename}",
+                file_deleted=False,
+                vectors_deleted=True,
                 error=None
             )
         else:

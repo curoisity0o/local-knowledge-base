@@ -115,6 +115,9 @@ def init_session_state():
 
     if "vector_store" not in st.session_state:
         st.session_state.vector_store = None
+    
+    if "processing" not in st.session_state:
+        st.session_state.processing = False
 
     if "document_processor" not in st.session_state:
         st.session_state.document_processor = None
@@ -483,25 +486,78 @@ def render_chat_interface():
                             for source in message["sources"]:
                                 st.markdown(f"- {source}")
 
-        # 用户输入
-        user_input = st.chat_input("输入您的问题...")
+        # 检查是否正在处理中，显示提示而不是输入框
+        is_processing = st.session_state.get("processing", False)
+        
+        if is_processing:
+            # 处理中，不显示输入框，显示提示
+            st.info("🤖 正在处理您的问题，请稍候...")
+            user_input = None
+        else:
+            # 处理完成，显示输入框
+            user_input = st.chat_input(
+                "输入您的问题...",
+                key="chat_input"
+            )
 
-        if user_input:
-            # 添加用户消息
+        if user_input and not is_processing:
+            # 标记正在处理 - 先添加用户消息，再立即刷新
             st.session_state.messages.append({"role": "user", "content": user_input})
-            with chat_container:
-                with st.chat_message("user"):
-                    st.markdown(user_input)
-
+            st.session_state.processing = True
+            st.rerun()
+            
+        # 如果正在处理中，显示加载状态
+        if st.session_state.get("processing", False):
             # 生成回答
             with st.spinner("思考中..."):
                 try:
+                    # 自动检测向量存储是否已初始化
                     if not st.session_state.vector_store_initialized:
-                        st.warning("向量存储未初始化，请先上传文档")
-                        return
+                        # 尝试调用文档统计API检测是否有已索引的文档
+                        try:
+                            import requests
+                            stats_response = requests.get(
+                                "http://localhost:8000/api/v1/documents/stats",
+                                timeout=5
+                            )
+                            if stats_response.status_code == 200:
+                                stats = stats_response.json()
+                                if stats.get("indexed_documents", 0) > 0:
+                                    # 已有索引的文档，自动标记为已初始化
+                                    st.session_state.vector_store_initialized = True
+                                    # 创建一个假的 vector_store 对象用于查询
+                                    class FakeVectorStore:
+                                        def __init__(self):
+                                            self.vector_store = "initialized"
+
+                                        def get_collection_info(self):
+                                            return {
+                                                "status": "ok",
+                                                "message": "通过 API 初始化",
+                                            }
+
+                                    st.session_state.vector_store = FakeVectorStore()
+                        except Exception as detect_e:
+                            logger.warning(f"检测向量存储状态失败: {detect_e}")
+
+                    if not st.session_state.vector_store_initialized:
+                        error_msg = "向量存储未初始化，请先上传并处理文档"
+                        st.warning(error_msg)
+                        # 添加错误消息
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": error_msg}
+                        )
+                        with chat_container:
+                            with st.chat_message("assistant"):
+                                st.markdown(error_msg)
+                        st.session_state.processing = False
+                        st.rerun()
 
                     # 使用 API 进行查询，传递用户选择的模型模式
                     import requests
+                    
+                    # 获取用户最后一个问题
+                    user_input = st.session_state.messages[-1]["content"]
 
                     selected_provider = st.session_state.selected_model
                     response = requests.post(
@@ -511,7 +567,7 @@ def render_chat_interface():
                             "top_k": 4,
                             "provider": selected_provider,
                         },
-                        timeout=60,
+                        timeout=120,
                     )
 
                     if response.status_code == 200:
@@ -533,17 +589,31 @@ def render_chat_interface():
                                         for i, source in enumerate(sources):
                                             st.markdown(f"{i + 1}. {source}")
                     else:
-                        st.error(f"查询失败: {response.status_code}")
+                        error_msg = f"查询失败: {response.status_code}"
+                        st.error(error_msg)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": error_msg}
+                        )
+                        with chat_container:
+                            with st.chat_message("assistant"):
+                                st.markdown(error_msg)
 
                 except Exception as e:
                     logger.error(f"生成回答失败: {e}")
-                    error_msg = f"抱歉，生成回答时出现错误: {str(e)}"
+                    error_msg = f"生成回答失败: {e}"
+                    st.error(error_msg)
+                    # 显示错误消息
                     st.session_state.messages.append(
                         {"role": "assistant", "content": error_msg}
                     )
                     with chat_container:
                         with st.chat_message("assistant"):
                             st.markdown(error_msg)
+                finally:
+                    # 处理完成，启用输入
+                    st.session_state.processing = False
+                    # 刷新页面更新状态
+                    st.rerun()
 
 
 # 文档管理界面
