@@ -34,10 +34,44 @@ document_processing:
     separators: ["\n\n", "\n", "。", "？", "！", "；", "?", "!", ";", "…", "……"]
     keep_separator: true
     
+  # 简单文档使用预处理，Markdown关闭预处理以保护公式
   preprocessing:
     remove_extra_whitespace: true
     normalize_unicode: true
     handle_mixed_language: true
+    
+    # Markdown文档专用配置（保护公式）
+    markdown:
+      enabled: true
+      # 跳过破坏性预处理
+      skip_whitespace_normalize: true
+      skip_unicode_normalize: true
+      skip_mixed_language: true
+      # 使用语义分块
+      use_semantic_chunking: true
+
+  # 简单文档格式（使用传统预处理）
+  simple_formats:
+    - "pdf"
+    - "txt"
+    - "docx"
+    - "html"
+    - "csv"
+
+# MinerU API配置（用于PDF转Markdown）
+mineru:
+  enabled: false  # 是否启用MinerU API
+  api_token: "${MINERU_API_TOKEN:-}"  # API Token，有效期3个月
+  # API调用配置
+  convert:
+    is_ocr: false  # 是否启用OCR
+    enable_formula: true  # 是否启用公式识别
+    enable_table: true  # 是否启用表格识别
+    language: "ch"  # 文档语言
+    model_version: "vlm"  # 模型版本
+    max_wait_seconds: 300  # 最大等待时间（秒）
+    poll_interval: 5  # 轮询间隔（秒）
+  # PDF文件需要通过公网URL访问，请配置文件服务器或使用其他方式上传
 
 # 向量存储
 vector_store:
