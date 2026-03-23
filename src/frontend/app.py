@@ -764,6 +764,14 @@ def render_chat_interface():
                     # 获取用户最后一个问题
                     user_input = st.session_state.messages[-1]["content"]
 
+                    # 构建对话历史 (最近6条，不含当前)
+                    history = []
+                    for msg in st.session_state.messages[:-1][-6:]:
+                        history.append({
+                            "role": msg.get("role", "user"),
+                            "content": msg.get("content", "")
+                        })
+
                     selected_provider = st.session_state.selected_model
                     response = requests.post(
                         "http://localhost:8000/api/v1/query",
@@ -771,6 +779,7 @@ def render_chat_interface():
                             "question": user_input,
                             "top_k": 4,
                             "provider": selected_provider,
+                            "history": history,  # 传递对话历史
                         },
                         timeout=120,
                     )

@@ -39,6 +39,27 @@ class RAGChain:
         self.retrieval_top_k = int(get_config("rag.retriever.top_k", 4))
         self.score_threshold = float(get_config("rag.retriever.score_threshold", 0.0))
 
+        # 重排序配置
+        self.reranking_enabled = get_config("rag.reranking.enabled", False)
+        self.reranking_top_n = int(get_config("rag.reranking.top_n", 3))
+
+        # 混合搜索配置
+        self.hybrid_search_enabled = (
+            get_config("rag.retriever.type", "dense") == "hybrid"
+        )
+        self.hybrid_dense_weight = float(
+            get_config("rag.retriever.hybrid.dense_weight", 0.7)
+        )
+        self.hybrid_sparse_weight = float(
+            get_config("rag.retriever.hybrid.sparse_weight", 0.3)
+        )
+
+        # 跨语言搜索配置
+        self.cross_lingual_enabled = get_config("rag.cross_lingual.enabled", True)
+        self.translation_enabled = get_config(
+            "rag.cross_lingual.translation_enabled", True
+        )
+
         # 初始化状态
         self._initialized = False
 
@@ -156,7 +177,24 @@ class RAGChain:
 
             # 1. 检索相关文档
             if self.vector_store:
-                if self.score_threshold > 0:
+                # 跨语言混合搜索（支持中文查询英文文档）
+                if self.cross_lingual_enabled and self.hybrid_search_enabled:
+                    logger.info("使用跨语言混合搜索")
+                    retrieved_docs = self.vector_store.cross_lingual_hybrid_search(
+                        question,
+                        k=self.retrieval_top_k,
+                        dense_weight=self.hybrid_dense_weight,
+                        sparse_weight=self.hybrid_sparse_weight,
+                    )
+                elif self.hybrid_search_enabled:
+                    logger.info("使用混合搜索（向量 + BM25）")
+                    retrieved_docs = self.vector_store.hybrid_search(
+                        question,
+                        k=self.retrieval_top_k,
+                        dense_weight=self.hybrid_dense_weight,
+                        sparse_weight=self.hybrid_sparse_weight,
+                    )
+                elif self.score_threshold > 0:
                     docs_with_scores = self.vector_store.similarity_search_with_score(
                         question, k=self.retrieval_top_k
                     )
@@ -171,6 +209,14 @@ class RAGChain:
                     retrieved_docs = self.vector_store.similarity_search(
                         question, k=self.retrieval_top_k
                     )
+
+                # 2. 重排序（如启用）
+                if self.reranking_enabled and retrieved_docs:
+                    logger.info(f"执行重排序: {len(retrieved_docs)} 个文档")
+                    retrieved_docs = self.vector_store.rerank_documents(
+                        question, retrieved_docs, self.reranking_top_n
+                    )
+                    logger.info(f"重排序完成: {len(retrieved_docs)} 个文档")
             else:
                 retrieved_docs = []
 
@@ -235,12 +281,18 @@ class RAGChain:
         """构建提示词"""
         return f"""请基于以下参考文档回答用户问题。
 
+【重要约束】
+1. 仔细阅读参考文档中的内容，从文档中提取与问题相关的信息
+2. 如果文档中提到了相关的人名、概念、数据，可以合理推断它们与问题的关系
+3. 如果文档中确实没有相关信息，才说明"无法回答"
+4. 回答时引用你使用的信息来源（如"根据文档提到"、"论文中说明"等）
+
 参考文档：
 {context}
 
 用户问题：{question}
 
-请根据参考文档内容回答。回答要准确、简洁，并注明来源。如果文档中没有相关信息，请如实说明。"""
+请用中文回答。"""
 
     def get_status(self) -> Dict[str, Any]:
         """获取系统状态"""

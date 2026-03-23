@@ -6,7 +6,7 @@ FastAPI 主应用
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Dict, List, Optional
 import uvicorn
 import logging
 import os
@@ -83,6 +83,7 @@ class QueryRequest(BaseModel):
     top_k: Optional[int] = 4
     provider: Optional[str] = None
     use_rag: Optional[bool] = True
+    history: Optional[List[Dict[str, str]]] = []  # 对话历史 [{"role": "user/assistant", "content": "..."}]
 
 
 class QueryResponse(BaseModel):
@@ -162,6 +163,65 @@ class DocumentChunksResponse(BaseModel):
     file_path: str
     chunks_count: int
     chunks: List[dict]  # 每个chunk包含 content, chunk_index
+
+
+# ============== 辅助函数 ==============
+
+def _build_history_context(history: List[Dict[str, str]]) -> str:
+    """构建对话历史上下文"""
+    if not history:
+        return ""
+    
+    history_parts = []
+    for msg in history[-6:]:  # 最多保留最近6轮对话
+        role = "用户" if msg.get("role") == "user" else "助手"
+        history_parts.append(f"{role}：{msg.get('content', '')}")
+    
+    return "\n".join(history_parts)
+
+
+def _build_prompt_with_history(
+    question: str,
+    context: str,
+    history: List[Dict[str, str]],
+    is_short_fact: bool = False,
+) -> str:
+    """构建带历史的提示词"""
+    history_context = _build_history_context(history)
+
+    if history_context:
+        history_section = f"\n\n【对话历史】\n{history_context}\n"
+    else:
+        history_section = ""
+
+    # 核心原则：禁止幻觉
+    hallucination_warning = """
+【重要约束】
+1. 只使用参考文档中明确包含的信息，不要捏造、推断或补充文档中没有的概念、术语或数据
+2. 如果文档中没有提到某个概念，直接回答"文档中没有提到"，不要尝试解释或推测
+3. 引用格式：只能引用文档中明确存在的来源（如"根据文档A"、"论文指出"），不要生成虚假引用
+4. 如果问题无法基于文档回答，明确说明"根据提供的文档，无法回答这个问题"
+"""
+
+    if is_short_fact:
+        return f"""基于以下参考文档，直接提取并回答用户问题。
+如果文档中有相关数值，直接给出答案，不需要解释。
+{hallucination_warning}
+参考文档：
+{context}{history_section}
+用户问题：{question}
+
+请直接回答："""
+    else:
+        return f"""基于以下参考文档回答用户问题。
+{hallucination_warning}
+{history_section}
+参考文档：
+{context}
+
+用户问题：{question}
+
+请用中文回答。"""
 
 
 # API 端点
@@ -351,25 +411,13 @@ async def query_knowledge_base(request: QueryRequest):
                     ]
                 )
 
-                if is_short_fact:
-                    prompt = f"""基于以下参考文档，直接提取并回答用户问题。
-如果文档中有相关数值，直接给出答案，不需要解释。
-
-参考文档：
-{context}
-
-用户问题：{request.question}
-
-请直接回答："""
-                else:
-                    prompt = f"""基于以下参考文档回答用户问题。
-
-参考文档：
-{context}
-
-用户问题：{request.question}
-
-请用中文回答，并注明引用来源："""
+                # 构建带历史的提示词
+                prompt = _build_prompt_with_history(
+                    question=request.question,
+                    context=context,
+                    history=request.history or [],
+                    is_short_fact=is_short_fact,
+                )
 
                 # 2. 生成答案
                 result = llm_manager.generate(prompt, provider=request.provider)
@@ -379,14 +427,34 @@ async def query_knowledge_base(request: QueryRequest):
                 sources = list(seen_sources)
             else:
                 # 无相关文档，直接回答
-                result = llm_manager.generate(
-                    request.question, provider=request.provider
-                )
+                history_context = _build_history_context(request.history or [])
+                if history_context:
+                    prompt = f"""【对话历史】
+{history_context}
+
+用户问题：{request.question}
+
+请结合对话历史和你的知识回答。如果历史中也没有相关信息，请如实说明。"""
+                    result = llm_manager.generate(prompt, provider=request.provider)
+                else:
+                    result = llm_manager.generate(
+                        request.question, provider=request.provider
+                    )
                 answer = result["text"]
                 sources = []
         else:
             # 直接生成模式
-            result = llm_manager.generate(request.question, provider=request.provider)
+            history_context = _build_history_context(request.history or [])
+            if history_context:
+                prompt = f"""【对话历史】
+{history_context}
+
+用户问题：{request.question}
+
+请结合对话历史和你的知识回答。"""
+                result = llm_manager.generate(prompt, provider=request.provider)
+            else:
+                result = llm_manager.generate(request.question, provider=request.provider)
             answer = result["text"]
             sources = []
 

@@ -143,12 +143,24 @@ class MinerUImporter:
             # 作者行特征：
             # - 包含 * 或 † 符号（脚注标记）
             # - 或只包含名字（2-4个单词）
-            # - 不能包含逗号分隔的机构信息太长
             if "*" in line or "†" in line:
-                # 移除脚注标记，提取作者名
-                author_name = re.sub(r"[*†‡\d]", "", line).strip()
-                if author_name and len(author_name) < 50:
-                    author_lines.append(author_name)
+                # 处理逗号分隔的多作者行（如 "Ling Yue1†, Nithin Somasekharan1†, ...")
+                if "," in line:
+                    # 按逗号分割，提取每个作者
+                    for part in line.split(","):
+                        # 移除脚注标记（*, †, ‡, 数字等）
+                        author_name = re.sub(r"[*†‡§\d]+", "", part).strip()
+                        # 清理多余的空白和符号
+                        author_name = re.sub(r"\s+", " ", author_name).strip()
+                        # 过滤：需要至少2个字符，且不能太长（人名通常<30字符）
+                        if author_name and 2 <= len(author_name) <= 30:
+                            author_lines.append(author_name)
+                else:
+                    # 单作者行，移除脚注标记
+                    author_name = re.sub(r"[*†‡§\d]+", "", line).strip()
+                    author_name = re.sub(r"\s+", " ", author_name).strip()
+                    if author_name and 2 <= len(author_name) <= 30:
+                        author_lines.append(author_name)
             elif re.match(r"^[A-Z][a-z]+(\s+[A-Z][a-z]+){0,3}$", line):
                 # 纯名字（2-4个单词，首字母大写）
                 if len(line) < 40:

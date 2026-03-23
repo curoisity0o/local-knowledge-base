@@ -113,8 +113,8 @@ embeddings:
 rag:
   retriever:
     type: "hybrid"  # hybrid, dense, sparse
-    top_k: "${RETRIEVAL_TOP_K:-4}"
-    score_threshold: "${RETRIEVAL_SCORE_THRESHOLD:-0.7}"
+    top_k: 10       # 增加到10，提升召回率
+    score_threshold: 0.5  # 降低阈值，匹配更多结果
     
     dense:
       search_type: "similarity"  # similarity, mmr
@@ -130,9 +130,14 @@ rag:
       sparse_weight: 0.3
   
   reranking:
-    enabled: "${ENABLE_RERANKING:-false}"
+    enabled: false  # 禁用重排序（需要下载bge-reranker-large模型）
     model: "${RERANKER_MODEL:-BAAI/bge-reranker-large}"
     top_n: 3
+    
+  # 跨语言搜索配置
+  cross_lingual:
+    enabled: true  # 启用跨语言搜索（中文查询英文文档）
+    translation_enabled: true  # 启用Query翻译
     
   generation:
     prompt_template: |

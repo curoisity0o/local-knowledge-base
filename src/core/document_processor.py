@@ -530,6 +530,16 @@ JSON格式："""
 
         return chunks
 
+    def _extract_author_info_for_chunk(self, metadata: Dict[str, Any]) -> str:
+        """从元数据中提取作者信息，格式化为 chunk 前缀"""
+        authors = metadata.get("authors", [])
+        if not authors:
+            return ""
+
+        # 格式化为 "Authors: Name1, Name2, Name3"
+        author_str = ", ".join(authors[:5])  # 最多5位作者
+        return f"Authors: {author_str}"
+
     def _split_markdown(self, documents: List[Document]) -> List[Document]:
         """Markdown专用分块：二级分块（标题+大小）"""
         all_chunks = []
@@ -541,6 +551,38 @@ JSON格式："""
             # 添加元数据
             for chunk in chunks:
                 chunk.metadata.update(doc.metadata)
+
+            # 合并作者信息到第一个 chunk
+            if chunks and len(chunks) > 1:
+                first_chunk = chunks[0]
+                second_chunk = chunks[1]
+                first_len = len(first_chunk.page_content)
+                second_len = len(second_chunk.page_content)
+
+                author_info = self._extract_author_info_for_chunk(doc.metadata)
+
+                # 如果第一个 chunk 很短（作者块），合并到第二个 chunk（摘要）
+                if first_len < 400 and author_info:
+                    # 合并：作者信息 + 第一个 chunk + 第二个 chunk
+                    merged_content = (
+                        author_info
+                        + "\n\n"
+                        + first_chunk.page_content
+                        + "\n\n"
+                        + second_chunk.page_content[:500]  # 限制摘要长度
+                    )
+                    first_chunk.page_content = merged_content
+                    # 删除第二个 chunk（已合并）
+                    chunks.pop(1)
+                    logger.info(
+                        f"已合并作者信息到摘要: Authors + {first_len} + {second_len} chars"
+                    )
+                elif first_len < 400 and author_info:
+                    # 如果没有第二个 chunk，直接添加作者前缀
+                    first_chunk.page_content = (
+                        author_info + "\n\n" + first_chunk.page_content
+                    )
+                    logger.info(f"已添加作者前缀: {author_info[:50]}...")
 
             all_chunks.extend(chunks)
 
