@@ -317,6 +317,15 @@ pytest tests/ --cov=src/core --cov-report=term-missing
 - ✅ Ollama服务连接正常
 - ✅ API服务器启动正常
 
+## 用户保留文件
+
+根据用户要求，以下mineru相关文件明确保留，用户将自行处理PDF转Markdown功能：
+
+- `src/core/mineru_api.py` - MinerU API集成
+- `src/utils/mineru_importer.py` - MinerU导入工具
+
+这些文件不会在代码清理过程中被修改或删除。
+
 ## 🤝 贡献
 
 欢迎提交 Issue 和 Pull Request！
