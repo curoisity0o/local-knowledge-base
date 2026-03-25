@@ -139,7 +139,7 @@ class LLMManager:
                     api_key=openai_api_key,
                     model=openai_config.get("model", "gpt-4o-mini"),
                     temperature=openai_config.get("temperature", 0.1),
-                    max_tokens=openai_config.get("max_tokens", 2000),  # type: ignore
+                    max_tokens=openai_config.get("max_tokens", 2000),  # type: ignore[call-arg, arg-type]
                     streaming=True,
                 )
                 logger.info(f"初始化 OpenAI 客户端: {openai_config.get('model')}")
@@ -195,7 +195,7 @@ class LLMManager:
                     ),
                     model=deepseek_config.get("model", "deepseek-chat"),
                     temperature=deepseek_config.get("temperature", 0.1),
-                    max_tokens=deepseek_config.get("max_tokens", 2000),  # type: ignore
+                    max_tokens=deepseek_config.get("max_tokens", 2000),  # type: ignore[call-arg, arg-type]
                 )
                 logger.info(f"初始化 DeepSeek 客户端: {deepseek_config.get('model')}")
 
@@ -209,7 +209,7 @@ class LLMManager:
                     base_url=kimi_config.get("base_url", "https://api.moonshot.cn/v1"),
                     model=kimi_config.get("model", "moonshot-v1-8k-vision-preview"),
                     temperature=kimi_config.get("temperature", 0.1),
-                    max_tokens=kimi_config.get("max_tokens", 2000),  # type: ignore[arg-type]
+                    max_tokens=kimi_config.get("max_tokens", 2000),  # type: ignore[call-arg, arg-type]
                 )
                 logger.info(f"初始化 Kimi 客户端: {kimi_config.get('model')}")
 
