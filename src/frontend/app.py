@@ -342,7 +342,8 @@ def render_sidebar():
         try:
             response = requests.get("http://localhost:8000/health", timeout=2)
             st.session_state.api_connected = response.status_code == 200
-        except:
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"API健康检查失败: {e}")
             st.session_state.api_connected = False
         st.session_state.api_checked = True
 
@@ -377,8 +378,8 @@ def render_sidebar():
             if response.status_code == 200:
                 st.session_state.api_connected = True
                 st.rerun()
-        except:
-            pass
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            logger.debug(f"API连接重试失败: {e}")
 
     with st.sidebar:
         st.markdown("### 🛠️ 系统设置")
@@ -767,10 +768,12 @@ def render_chat_interface():
                     # 构建对话历史 (最近6条，不含当前)
                     history = []
                     for msg in st.session_state.messages[:-1][-6:]:
-                        history.append({
-                            "role": msg.get("role", "user"),
-                            "content": msg.get("content", "")
-                        })
+                        history.append(
+                            {
+                                "role": msg.get("role", "user"),
+                                "content": msg.get("content", ""),
+                            }
+                        )
 
                     selected_provider = st.session_state.selected_model
                     response = requests.post(
@@ -968,7 +971,7 @@ def render_document_management():
         with col1:
             # 获取已索引的文档列表
             indexed_docs = []  # type: ignore
-            if response.status_code == 200:
+            if response and response.status_code == 200:
                 for doc in documents:  # type: ignore
                     if doc.get("vector_status") == "indexed":
                         indexed_docs.append(doc.get("filename", ""))
