@@ -3,19 +3,20 @@ FastAPI 主应用
 提供知识库系统的 REST API 接口
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Dict, List, Optional
-import uvicorn
 import logging
 import os
 from pathlib import Path
+from typing import Dict, List, Optional
+
+import uvicorn
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from src.core.config import config
 from src.core.document_processor import DocumentProcessor
-from src.core.vector_store import SimpleVectorStore
 from src.core.llm_manager import LLMManager
+from src.core.vector_store import SimpleVectorStore
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -83,7 +84,9 @@ class QueryRequest(BaseModel):
     top_k: Optional[int] = 4
     provider: Optional[str] = None
     use_rag: Optional[bool] = True
-    history: Optional[List[Dict[str, str]]] = []  # 对话历史 [{"role": "user/assistant", "content": "..."}]
+    history: Optional[List[Dict[str, str]]] = (
+        []
+    )  # 对话历史 [{"role": "user/assistant", "content": "..."}]
 
 
 class QueryResponse(BaseModel):
@@ -167,16 +170,17 @@ class DocumentChunksResponse(BaseModel):
 
 # ============== 辅助函数 ==============
 
+
 def _build_history_context(history: List[Dict[str, str]]) -> str:
     """构建对话历史上下文"""
     if not history:
         return ""
-    
+
     history_parts = []
     for msg in history[-6:]:  # 最多保留最近6轮对话
         role = "用户" if msg.get("role") == "user" else "助手"
         history_parts.append(f"{role}：{msg.get('content', '')}")
-    
+
     return "\n".join(history_parts)
 
 
@@ -454,7 +458,9 @@ async def query_knowledge_base(request: QueryRequest):
 请结合对话历史和你的知识回答。"""
                 result = llm_manager.generate(prompt, provider=request.provider)
             else:
-                result = llm_manager.generate(request.question, provider=request.provider)
+                result = llm_manager.generate(
+                    request.question, provider=request.provider
+                )
             answer = result["text"]
             sources = []
 
@@ -506,9 +512,9 @@ async def import_from_mineru(request: MinerUImportRequest):
     7. 自动向量化（如已存在则覆盖）
     """
     try:
-        from src.utils.mineru_importer import import_mineru_document
         from src.core.document_processor import DocumentProcessor
         from src.core.vector_store import SimpleVectorStore
+        from src.utils.mineru_importer import import_mineru_document
 
         # 1. 执行导入
         result = import_mineru_document(request.mineru_dir)
@@ -662,7 +668,7 @@ async def process_documents(request: DocumentProcessRequest):
 
         # 添加到向量存储
         if documents:
-            ids = vector_store.add_documents(documents)
+            vector_store.add_documents(documents)
 
             return DocumentProcessResponse(
                 success=True,
@@ -673,7 +679,7 @@ async def process_documents(request: DocumentProcessRequest):
             # 全部已存在
             return DocumentProcessResponse(
                 success=True,
-                message=f"所有文档已存在，无需重复处理",
+                message="所有文档已存在，无需重复处理",
                 chunks_count=0,
             )
         else:
@@ -831,8 +837,8 @@ async def delete_document(filename: str, delete_file: bool = True):
         delete_file: 是否同时删除物理文件，默认True
     """
     try:
-        from pathlib import Path
         import shutil
+        from pathlib import Path
 
         # 获取项目根目录
         project_root = Path(__file__).parent.parent.parent
@@ -1143,7 +1149,7 @@ async def warmup_model():
         if llm_manager.is_local_available():
             logger.info("预热本地模型...")
             # 生成一个简单的回复来加载模型到内存
-            result = llm_manager.generate("你好", provider="local")
+            llm_manager.generate("你好", provider="local")
             return {"success": True, "message": "模型预热完成"}
         else:
             return {"success": False, "message": "本地模型不可用"}

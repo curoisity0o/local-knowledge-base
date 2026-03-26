@@ -3,26 +3,24 @@
 负责加载、分割和预处理文档
 """
 
-import os
-import re
 import json
-from pathlib import Path
-from typing import List, Dict, Any, Optional
 import logging
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from langchain_community.document_loaders import (
+    CSVLoader,
+    Docx2txtLoader,
     PyPDFLoader,
     TextLoader,
-    Docx2txtLoader,
-    UnstructuredMarkdownLoader,
-    CSVLoader,
     UnstructuredHTMLLoader,
 )
-from langchain_text_splitters import (
-    RecursiveCharacterTextSplitter,
-    MarkdownHeaderTextSplitter,
-)
 from langchain_core.documents import Document
+from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
 
 from .config import get_config
 
@@ -712,12 +710,12 @@ JSON格式："""
         for i, chunk in enumerate(chunks):
             chunk_file = output_path / f"{base_name}_chunk_{i:03d}.txt"
             with open(chunk_file, "w", encoding="utf-8") as f:
-                f.write(f"=== 元数据 ===\n")
+                f.write("=== 元数据 ===\n")
                 for key, value in chunk.metadata.items():
                     f.write(f"{key}: {value}\n")
-                f.write(f"\n=== 内容 ===\n")
+                f.write("\n=== 内容 ===\n")
                 f.write(chunk.page_content)
-                f.write(f"\n=== 结束 ===\n")
+                f.write("\n=== 结束 ===\n")
 
 
 # 便捷函数

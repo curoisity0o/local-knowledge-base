@@ -3,12 +3,12 @@
 负责管理本地模型和云 API 的智能切换
 """
 
+import logging
 import os
 import time
-from pathlib import Path
-from typing import Dict, Any, Optional, List
-import logging
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from langchain_ollama import OllamaLLM
 from langchain_openai import ChatOpenAI
@@ -70,7 +70,7 @@ class LLMManager:
             modelscope_model_path = (
                 Path(model_cache_base) / "deepseek-ai" / "DeepSeek-V2-Lite"
             )
-            use_modelscope = modelscope_model_path.exists()
+            modelscope_model_path.exists()
 
             if provider == "ollama":
                 # 只使用 Ollama，不回退
@@ -632,9 +632,11 @@ class CostController:
             "cost_today": self.cost_today,
             "usage_count": len(self.usage_today),
             "remaining_budget": self.budget_daily - self.cost_today,
-            "budget_usage_percent": (self.cost_today / self.budget_daily * 100)
-            if self.budget_daily > 0
-            else 0,
+            "budget_usage_percent": (
+                (self.cost_today / self.budget_daily * 100)
+                if self.budget_daily > 0
+                else 0
+            ),
         }
 
 

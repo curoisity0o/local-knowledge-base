@@ -3,12 +3,11 @@ Agent 工具定义
 定义Agent可用的各种工具
 """
 
-from typing import Dict, Any, List, Optional, Callable
-from pathlib import Path
 import ast
-import operator
 import logging
-import json
+import operator
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -209,46 +208,46 @@ def create_file_reader_tool(base_path: str = "./data") -> Callable:
 def safe_join(base_path: str, user_path: str) -> Path:
     """
     安全地拼接路径，防止路径遍历攻击
-    
+
     Args:
         base_path: 基础路径
         user_path: 用户提供的相对路径
-        
+
     Returns:
         安全的绝对路径
-        
+
     Raises:
         ValueError: 如果检测到路径遍历攻击
     """
     # 解析路径
     base = Path(base_path).resolve()
     user = Path(user_path)
-    
+
     # 防止绝对路径
     if user.is_absolute():
         raise ValueError("路径遍历攻击检测：不允许绝对路径")
-    
+
     # 拼接并解析路径
     full_path = (base / user).resolve()
-    
+
     # 验证结果路径在基础路径内
     if not str(full_path).startswith(str(base)):
         raise ValueError("路径遍历攻击检测：路径越界")
-    
+
     return full_path
 
 
 def safe_eval(expression: str, allowed_names: Dict[str, Any]) -> Any:
     """
     安全地求值数学表达式
-    
+
     Args:
         expression: 数学表达式字符串
         allowed_names: 允许使用的变量名和值
-        
+
     Returns:
         表达式求值结果
-        
+
     Raises:
         ValueError: 表达式不安全或求值失败
     """
@@ -263,15 +262,15 @@ def safe_eval(expression: str, allowed_names: Dict[str, Any]) -> Any:
         ast.USub: operator.neg,  # 一元负号
         ast.UAdd: operator.pos,  # 一元正号
     }
-    
+
     # 检查表达式长度（防止DoS）
     if len(expression) > 1000:
         raise ValueError("表达式过长")
-    
+
     try:
         # 解析表达式为AST
-        tree = ast.parse(expression, mode='eval')
-        
+        tree = ast.parse(expression, mode="eval")
+
         # 定义AST节点检查器
         def check_node(node):
             """递归检查AST节点安全性"""
@@ -299,14 +298,14 @@ def safe_eval(expression: str, allowed_names: Dict[str, Any]) -> Any:
                 raise ValueError("下标访问不被允许")
             else:
                 raise ValueError(f"不支持的AST节点: {type(node)}")
-        
+
         # 检查AST安全性
         check_node(tree)
-        
+
         # 安全地编译和执行
-        code = compile(tree, '<string>', 'eval')
+        code = compile(tree, "<string>", "eval")
         return eval(code, {"__builtins__": {}}, allowed_names)
-        
+
     except SyntaxError as e:
         raise ValueError(f"表达式语法错误: {e}")
     except Exception as e:

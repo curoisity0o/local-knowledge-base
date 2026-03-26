@@ -3,11 +3,11 @@
 避免复杂的导入问题
 """
 
-from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional, Union
 import logging
 import os
 from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
 
@@ -27,7 +27,7 @@ class LanguageDetector:
 
     def _ensure_initialized(self):
         if self._detector is None:
-            from langdetect import detect, DetectorFactory
+            from langdetect import DetectorFactory, detect
 
             # 确保结果一致
             DetectorFactory.seed = 0
@@ -110,7 +110,7 @@ class QueryTranslator:
             return query
 
         try:
-            prompt = f"""Translate the following text to {target_lang}. 
+            prompt = f"""Translate the following text to {target_lang}.
 Only output the translation, nothing else.
 
 Text: {query}
@@ -343,7 +343,7 @@ class Reranker:
                 scores = [scores]
 
             # 按分数排序（降序）
-            doc_score_pairs = list(zip(documents, scores))
+            doc_score_pairs = list(zip(documents, scores, strict=False))
             doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
 
             # 返回顶部N个文档
@@ -410,7 +410,7 @@ class SimpleVectorStore:
                 logger.error(f"Ollama 嵌入模型初始化失败: {e}")
                 logger.error("请确保 Ollama 服务正在运行: ollama serve")
                 logger.error("请确保已下载嵌入模型: ollama pull bge-m3")
-                raise RuntimeError(f"无法初始化 Ollama 嵌入模型: {e}")
+                raise RuntimeError(f"无法初始化 Ollama 嵌入模型: {e}") from e
 
             # 初始化向量存储
             if self.store_type == "chroma":
@@ -740,9 +740,9 @@ class SimpleVectorStore:
 
         info = {
             "store_type": self.store_type,
-            "embedding_model": "ollama"
-            if hasattr(self, "_using_ollama")
-            else "huggingface",
+            "embedding_model": (
+                "ollama" if hasattr(self, "_using_ollama") else "huggingface"
+            ),
             "status": "initialized" if self._initialized else "not_initialized",
         }
 

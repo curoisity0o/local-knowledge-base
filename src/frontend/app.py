@@ -3,11 +3,11 @@
 提供文档上传、问答交互和系统管理界面
 """
 
-import streamlit as st
-import sys
-import os
 import re
+import sys
 from pathlib import Path
+
+import streamlit as st
 
 # 添加项目根目录到 Python 路径
 project_root = Path(__file__).parent.parent.parent
@@ -15,7 +15,6 @@ sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "src"))
 
 import logging
-from datetime import datetime
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -198,8 +197,9 @@ def get_document_processor():
 
 def check_components_status(mode: str = "local", retries: int = 3, delay: float = 1.0):
     """根据模式检查组件状态，带重试机制"""
-    import requests
     import time
+
+    import requests
 
     last_error = None
 
@@ -849,8 +849,8 @@ def render_chat_interface():
 # 文档管理界面
 def render_document_management():
     """渲染文档管理界面（包含列表、统计、查看功能）"""
-    import requests
     import pandas as pd
+    import requests
 
     # 初始化变量
     response = None
@@ -1091,6 +1091,7 @@ def render_system_info():
         if st.button("📋 生成诊断报告"):
             try:
                 import platform
+
                 import psutil
 
                 info = {

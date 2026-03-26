@@ -3,12 +3,10 @@ RAG Agent
 基于知识库的问答Agent
 """
 
-import re
-from typing import Dict, Any, List, Optional
 import logging
+from typing import Any, Dict, Optional
 
-from .base_agent import BaseAgent, AgentConfig, AgentState, AgentMessage
-from .tools import get_default_tools
+from .base_agent import AgentConfig, AgentState, BaseAgent
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +59,9 @@ class RAGAgent(BaseAgent):
     def _init_tools(self) -> None:
         """初始化工具"""
         from .tools import (
-            create_search_tool,
-            create_retrieve_documents_tool,
             create_list_documents_tool,
+            create_retrieve_documents_tool,
+            create_search_tool,
         )
 
         if self.vector_store:

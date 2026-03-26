@@ -3,17 +3,17 @@ RAG Chain 模块
 完整的RAG流水线实现
 """
 
-from typing import Dict, Any, List, Optional, Callable
-from pathlib import Path
 import logging
 import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
 
 from .config import get_config
 from .document_processor import DocumentProcessor
-from .vector_store import SimpleVectorStore
 from .llm_manager import LLMManager
+from .vector_store import SimpleVectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -242,9 +242,11 @@ class RAGChain:
                 "answer": answer,
                 "sources": [
                     {
-                        "content": doc.page_content[:200] + "..."
-                        if len(doc.page_content) > 200
-                        else doc.page_content,
+                        "content": (
+                            doc.page_content[:200] + "..."
+                            if len(doc.page_content) > 200
+                            else doc.page_content
+                        ),
                         "source": doc.metadata.get("source", "未知"),
                         "page": doc.metadata.get("page", None),
                     }

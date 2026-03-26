@@ -3,13 +3,12 @@ MinerU 文档导入工具
 用于从 MinerU 输出目录导入文档到知识库系统
 """
 
-import os
-import re
 import json
+import logging
+import re
 import shutil
 from pathlib import Path
-from typing import Dict, Any, Optional, List
-import logging
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +120,7 @@ class MinerUImporter:
         lines = content.split("\n")
 
         # 提取标题（第一个 # 标题）
-        for i, line in enumerate(lines):
+        for _i, line in enumerate(lines):
             line = line.strip()
             if line.startswith("# ") and not line.startswith("##"):
                 metadata["title"] = line[2:].strip()
