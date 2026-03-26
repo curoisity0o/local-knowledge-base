@@ -59,7 +59,7 @@ class BaseAgent(ABC):
     @abstractmethod
     def process(self, input_data: Any) -> Dict[str, Any]:
         """处理输入，返回结果"""
-        pass
+        raise NotImplementedError("子类必须实现 process() 方法")
 
     def add_message(
         self,

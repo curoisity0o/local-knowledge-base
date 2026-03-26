@@ -428,7 +428,8 @@ class LLMManager:
                 result = self._fallback_generate(prompt, **kwargs)
                 result["metadata"]["error"] = str(e)
                 return result
-            except Exception:
+            except Exception as fb_e:
+                logger.error(f"后备生成也失败: {fb_e}")
                 return {
                     "text": f"抱歉，生成回答时发生错误: {str(e)}",
                     "tokens": {"input": 0, "output": 0},

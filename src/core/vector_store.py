@@ -5,6 +5,7 @@
 
 import logging
 import os
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -167,8 +168,6 @@ class BM25:
 
     def _tokenize(self, text: str) -> List[str]:
         """简单分词（按空格和标点）"""
-        import re
-
         # 中英文混合分词
         tokens = re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z]+|\d+|[^\s\w]", text.lower())
         # 过滤单字符和纯数字
@@ -754,8 +753,8 @@ class SimpleVectorStore:
                 collection = self.vector_store._collection
                 if hasattr(collection, "count"):
                     info["document_count"] = collection.count()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"获取文档数量失败（可忽略）: {e}")
 
         return info
 
