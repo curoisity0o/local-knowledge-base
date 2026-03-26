@@ -5,13 +5,14 @@ FastAPI 主应用
 
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from src.core.config import config
 from src.core.document_processor import DocumentProcessor
@@ -52,41 +53,56 @@ app.add_middleware(
 _processor = None
 _vector_store = None
 _llm_manager = None
+_init_lock = threading.Lock()
 
 
 def get_processor():
-    """获取文档处理器实例"""
+    """获取文档处理器实例（线程安全）"""
     global _processor
     if _processor is None:
-        _processor = DocumentProcessor()
+        with _init_lock:
+            if _processor is None:
+                _processor = DocumentProcessor()
     return _processor
 
 
 def get_vector_store():
-    """获取向量存储实例"""
+    """获取向量存储实例（线程安全）"""
     global _vector_store
     if _vector_store is None:
-        _vector_store = SimpleVectorStore()
+        with _init_lock:
+            if _vector_store is None:
+                _vector_store = SimpleVectorStore()
     return _vector_store
 
 
 def get_llm_manager():
-    """获取 LLM 管理器实例"""
+    """获取 LLM 管理器实例（线程安全）"""
     global _llm_manager
     if _llm_manager is None:
-        _llm_manager = LLMManager()
+        with _init_lock:
+            if _llm_manager is None:
+                _llm_manager = LLMManager()
     return _llm_manager
 
 
 # 请求/响应模型
 class QueryRequest(BaseModel):
-    question: str
-    top_k: Optional[int] = 4
+    question: str = Field(..., min_length=1, max_length=2000, description="用户问题")
+    top_k: Optional[int] = Field(default=4, ge=1, le=20, description="返回文档数量")
     provider: Optional[str] = None
     use_rag: Optional[bool] = True
-    history: Optional[List[Dict[str, str]]] = (
-        []
-    )  # 对话历史 [{"role": "user/assistant", "content": "..."}]
+    history: Optional[List[Dict[str, str]]] = Field(
+        default_factory=list, description="对话历史 [{'role': 'user/assistant', 'content': '...'}]"
+    )
+
+    @field_validator("question")
+    @classmethod
+    def question_must_not_be_blank(cls, v: str) -> str:
+        """确保问题不为纯空白字符"""
+        if not v.strip():
+            raise ValueError("问题不能为空白内容")
+        return v.strip()
 
 
 class QueryResponse(BaseModel):
@@ -169,6 +185,31 @@ class DocumentChunksResponse(BaseModel):
 
 
 # ============== 辅助函数 ==============
+
+
+def _validate_filename(filename: str, base_dir: Path) -> Path:
+    """验证文件名并返回安全的绝对路径，防止路径遍历攻击。
+
+    Args:
+        filename: 待验证的文件名（不允许含路径分隔符）
+        base_dir: 允许的根目录
+
+    Returns:
+        安全的绝对文件路径
+
+    Raises:
+        HTTPException 400: 文件名非法或路径超出允许范围
+    """
+    if not filename:
+        raise HTTPException(status_code=400, detail="文件名不能为空")
+    # 只允许纯文件名，不允许包含目录分隔符
+    if filename != Path(filename).name:
+        raise HTTPException(status_code=400, detail="非法文件名：不允许包含路径分隔符")
+    resolved = (base_dir / filename).resolve()
+    # 使用 is_relative_to 确保路径在允许目录内（Python 3.9+）
+    if not resolved.is_relative_to(base_dir.resolve()):
+        raise HTTPException(status_code=400, detail="非法文件名：路径超出允许范围")
+    return resolved
 
 
 def _build_history_context(history: List[Dict[str, str]]) -> str:
@@ -574,7 +615,9 @@ async def upload_document(file: UploadFile = File(...)):
 
         os.makedirs(upload_dir, exist_ok=True)
 
-        file_path = os.path.join(upload_dir, file.filename or "uploaded_file")
+        # 验证文件名，防止路径遍历攻击
+        safe_filename = file.filename or "uploaded_file"
+        file_path = str(_validate_filename(safe_filename, Path(upload_dir).resolve()))
 
         with open(file_path, "wb") as f:
             content = await file.read()
@@ -587,6 +630,8 @@ async def upload_document(file: UploadFile = File(...)):
             "file_size": len(content),
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"文件上传失败: {e}")
         raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
@@ -851,8 +896,8 @@ async def delete_document(filename: str, delete_file: bool = True):
 
         raw_docs_path = Path(raw_docs_dir)
 
-        # 查找文件
-        file_path = raw_docs_path / filename
+        # 验证文件名，防止路径遍历攻击
+        file_path = _validate_filename(filename, raw_docs_path)
 
         if not file_path.exists():
             # 如果文件不存在但用户想删除向量，仍然继续
