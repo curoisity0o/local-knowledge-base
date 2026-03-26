@@ -31,36 +31,31 @@ class ChineseTextSplitter(RecursiveCharacterTextSplitter):
     """中文优化的文本分割器，支持保护LaTeX公式和Markdown格式"""
 
     def __init__(self, **kwargs):
-        # 中文友好的分隔符 + LaTeX公式边界保护
+        # 中文友好的分隔符（按优先级从高到低排列，无重复）
         separators = [
             # 段落级别
             "\n\n",
             "\n",
-            # LaTeX公式边界（优先保护）
-            "$$",  # 块公式 $$...$$
+            # 代码/公式块边界
             "```",  # 代码块
-            # Markdown格式标记（保护斜体和加粗）
-            "****",  # 加粗结束
-            "****",  # 加粗开始
-            "**",
-            "**",
-            "****",
-            "__",  # 另一种加粗
-            "__",
-            # Markdown标题
-            "##",
-            "###",
-            "#",
-            # 句子级别
+            "$$",   # 块公式 $$...$$
+            # 句子级别（中文）
             "。",
             "？",
             "！",
             "；",
+            # 句子级别（英文）
             "?",
             "!",
             ";",
-            "…",
+            # 省略号
             "……",
+            "…",
+            # 词语级别
+            "，",
+            ",",
+            " ",
+            "",
         ]
         super().__init__(separators=separators, **kwargs)
 
@@ -101,11 +96,8 @@ class MarkdownAwareSplitter:
             separators=[
                 "\n\n",
                 "\n",
-                "$$",  # 块公式
                 "```",  # 代码块
-                "##",
-                "###",
-                "#",
+                "$$",   # 块公式
                 "。",
                 "？",
                 "！",
@@ -113,8 +105,12 @@ class MarkdownAwareSplitter:
                 "?",
                 "!",
                 ";",
-                "…",
                 "……",
+                "…",
+                "，",
+                ",",
+                " ",
+                "",
             ],
         )
 
@@ -127,6 +123,84 @@ class MarkdownAwareSplitter:
         final_chunks = self.text_splitter.split_documents(header_docs)
 
         return final_chunks
+
+
+class ParentChildSplitter:
+    """父子分块器：将文档分为大粒度父块和小粒度子块。
+
+    父块提供完整上下文，子块用于精准向量检索。
+    子块的 metadata 中包含父块内容（parent_content），
+    检索时命中子块，返回父块内容以提升答案质量。
+    """
+
+    SEPARATORS = [
+        "\n\n", "\n", "```", "$$",
+        "。", "？", "！", "；", "?", "!", ";",
+        "……", "…", "，", ",", " ", "",
+    ]
+
+    def __init__(
+        self,
+        parent_chunk_size: int = 1500,
+        child_chunk_size: int = 400,
+        chunk_overlap: int = 50,
+    ):
+        self.parent_chunk_size = parent_chunk_size
+        self.child_chunk_size = child_chunk_size
+        self.chunk_overlap = chunk_overlap
+
+        self.parent_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=parent_chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=self.SEPARATORS,
+        )
+        self.child_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=child_chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=self.SEPARATORS,
+        )
+
+    def split_documents(
+        self, documents: List[Document]
+    ) -> List[Document]:
+        """将文档拆分为子块列表，每个子块携带父块内容。
+
+        Returns:
+            子块列表（metadata 含 parent_content / parent_id / chunk_index / total_chunks）
+        """
+        child_docs: List[Document] = []
+
+        for doc in documents:
+            source = doc.metadata.get("source", "unknown")
+            # 1. 先切父块
+            parent_chunks = self.parent_splitter.split_text(doc.page_content)
+
+            for p_idx, parent_text in enumerate(parent_chunks):
+                parent_id = f"{source}__parent_{p_idx}"
+
+                # 2. 每个父块再切子块
+                child_texts = self.child_splitter.split_text(parent_text)
+                total = len(child_texts)
+
+                for c_idx, child_text in enumerate(child_texts):
+                    child_metadata = dict(doc.metadata)
+                    child_metadata.update(
+                        {
+                            "parent_id": parent_id,
+                            "parent_content": parent_text,
+                            "chunk_index": c_idx,
+                            "total_chunks": total,
+                            "parent_chunk_index": p_idx,
+                        }
+                    )
+                    child_docs.append(
+                        Document(page_content=child_text, metadata=child_metadata)
+                    )
+
+        logger.info(
+            "父子分块完成: %d 个文档 -> %d 个子块", len(documents), len(child_docs)
+        )
+        return child_docs
 
 
 class DocumentProcessor:
@@ -143,6 +217,14 @@ class DocumentProcessor:
         chunk_size = int(chunk_size) if chunk_size is not None else 800
         chunk_overlap = int(chunk_overlap) if chunk_overlap is not None else 100
 
+        # 父子分块配置
+        parent_chunk_size = int(
+            get_config("document_processing.chunking.parent_chunk_size", 1500)
+        )
+        child_chunk_size = int(
+            get_config("document_processing.chunking.child_chunk_size", 400)
+        )
+
         # 传统分块器（用于非Markdown文件）
         self.text_splitter = ChineseTextSplitter(
             chunk_size=chunk_size,
@@ -155,6 +237,18 @@ class DocumentProcessor:
         self.markdown_splitter = MarkdownAwareSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
+        )
+
+        # 父子分块器（用于高质量上下文检索）
+        self.parent_child_splitter = ParentChildSplitter(
+            parent_chunk_size=parent_chunk_size,
+            child_chunk_size=child_chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+
+        # 是否启用父子分块模式
+        self.use_parent_child = bool(
+            get_config("document_processing.chunking.use_parent_child", False)
         )
 
         # 获取配置
@@ -519,8 +613,12 @@ JSON格式："""
             for doc in documents:
                 doc.page_content = self.preprocess_text(doc.page_content, file_format)
 
-        # 3. 分割文档（Markdown使用专用分块器）
-        if is_markdown:
+        # 3. 分割文档
+        if self.use_parent_child:
+            # 父子分块模式：子块用于检索，父块内容存入 metadata 以提供更完整上下文
+            logger.info(f"使用父子分块器: {file_path}")
+            chunks = self.parent_child_splitter.split_documents(documents)
+        elif is_markdown:
             logger.info(f"使用Markdown专用分块器: {file_path}")
             chunks = self._split_markdown(documents)
         else:
