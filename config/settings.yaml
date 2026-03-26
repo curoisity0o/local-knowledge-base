@@ -28,6 +28,10 @@ document_processing:
     chunk_size: "${CHUNK_SIZE:-800}"
     chunk_overlap: "${CHUNK_OVERLAP:-100}"
     max_chunks_per_doc: "${MAX_CHUNKS_PER_DOC:-100}"
+    # 父子分块配置（父块提供完整上下文，子块用于精准检索）
+    use_parent_child: false          # 设为 true 以启用父子分块模式
+    parent_chunk_size: 1500          # 父块大小（字符数）
+    child_chunk_size: 400            # 子块大小（字符数）
     
   text_splitter:
     type: "recursive_character"
@@ -128,6 +132,15 @@ rag:
       fusion_method: "weighted"  # weighted, reciprocal_rank_fusion
       dense_weight: 0.7
       sparse_weight: 0.3
+
+    # 父子上下文检索（需要文档以父子分块方式摄入）
+    parent_child:
+      enabled: false  # 设为 true 以启用父子上下文检索
+
+    # 多查询检索（用 LLM 生成查询变体，提升召回率）
+    multi_query:
+      enabled: false  # 设为 true 以启用多查询检索
+      num_queries: 3  # 生成查询变体数量
   
   reranking:
     enabled: false  # 禁用重排序（需要下载bge-reranker-large模型）
@@ -156,22 +169,45 @@ rag:
 # Agent配置
 agents:
   enabled: "${ENABLE_AGENTS:-true}"
-  
+
+  # 默认 Agent 类型: rag_agent | multi_step_rag_agent | research_agent
+  default_agent_type: "rag_agent"
+
   base_agent:
     max_iterations: "${AGENT_MAX_ITERATIONS:-5}"
     early_stopping: true
     reflection_enabled: true
-    
+
+  multi_step_agent:
+    max_iterations: 8
+    # 触发多步推理的问题字数阈值（超过此字数的问题才启用问题分解）
+    complexity_threshold: 30
+
   tools:
-    enabled_tools: "${AGENT_TOOLS:-['retrieval', 'calculator', 'web_search']}"
-    
+    # 已启用工具列表（按优先级排序）
+    enabled_tools:
+      - "hybrid_search"          # 混合搜索（推荐，替代原 retrieval）
+      - "parent_context_search"  # 父子上下文检索
+      - "decompose_query"        # 查询分解（复杂问题）
+      - "knowledge_summary"      # 知识库主题摘要
+      - "retrieve_documents"     # 带分数检索
+      - "search_knowledge"       # 基础向量搜索（兜底）
+      - "list_documents"         # 文档列表
+      - "calculate"              # 计算器
+      - "read_file"              # 文件读取
+
     retrieval:
-      top_k: 4
+      top_k: 5
       include_sources: true
-      
+
+    hybrid_search:
+      top_k: 5
+      dense_weight: 0.7
+      sparse_weight: 0.3
+
     calculator:
       precision: 4
-      
+
     web_search:
       max_results: 3
       timeout: 10

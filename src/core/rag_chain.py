@@ -60,6 +60,12 @@ class RAGChain:
             "rag.cross_lingual.translation_enabled", True
         )
 
+        # 父子上下文检索配置
+        self.parent_child_enabled = get_config("rag.retriever.parent_child.enabled", False)
+
+        # 多查询检索配置
+        self.multi_query_enabled = get_config("rag.retriever.multi_query.enabled", False)
+
         # 初始化状态
         self._initialized = False
 
@@ -177,38 +183,7 @@ class RAGChain:
 
             # 1. 检索相关文档
             if self.vector_store:
-                # 跨语言混合搜索（支持中文查询英文文档）
-                if self.cross_lingual_enabled and self.hybrid_search_enabled:
-                    logger.info("使用跨语言混合搜索")
-                    retrieved_docs = self.vector_store.cross_lingual_hybrid_search(
-                        question,
-                        k=self.retrieval_top_k,
-                        dense_weight=self.hybrid_dense_weight,
-                        sparse_weight=self.hybrid_sparse_weight,
-                    )
-                elif self.hybrid_search_enabled:
-                    logger.info("使用混合搜索（向量 + BM25）")
-                    retrieved_docs = self.vector_store.hybrid_search(
-                        question,
-                        k=self.retrieval_top_k,
-                        dense_weight=self.hybrid_dense_weight,
-                        sparse_weight=self.hybrid_sparse_weight,
-                    )
-                elif self.score_threshold > 0:
-                    docs_with_scores = self.vector_store.similarity_search_with_score(
-                        question, k=self.retrieval_top_k
-                    )
-                    # 过滤低分文档
-                    filtered_docs = [
-                        (doc, score)
-                        for doc, score in docs_with_scores
-                        if score <= self.score_threshold
-                    ]
-                    retrieved_docs = [doc for doc, _ in filtered_docs]
-                else:
-                    retrieved_docs = self.vector_store.similarity_search(
-                        question, k=self.retrieval_top_k
-                    )
+                retrieved_docs = self._retrieve_documents(question)
 
                 # 2. 重排序（如启用）
                 if self.reranking_enabled and retrieved_docs:
@@ -220,10 +195,10 @@ class RAGChain:
             else:
                 retrieved_docs = []
 
-            # 2. 构建上下文
+            # 3. 构建上下文
             context = self._build_context(retrieved_docs)
 
-            # 3. 生成回答
+            # 4. 生成回答
             if self.llm_manager and context:
                 prompt = self._build_prompt(question, context)
                 result = self.llm_manager.generate(prompt)
@@ -265,6 +240,63 @@ class RAGChain:
                 "error": str(e),
                 "processing_time": time.time() - start_time,
             }
+
+    def _retrieve_documents(self, question: str) -> List[Document]:
+        """统一检索入口，按配置选择检索策略。"""
+        if not self.vector_store:
+            return []
+
+        # 父子上下文检索（优先级最高，可与混合搜索叠加）
+        if self.parent_child_enabled:
+            logger.info("使用父子上下文检索")
+            return self.vector_store.parent_child_search(
+                question, k=self.retrieval_top_k
+            )
+
+        # 多查询检索
+        if self.multi_query_enabled:
+            logger.info("使用多查询检索（Multi-Query）")
+            return self.vector_store.multi_query_search(
+                question,
+                k=self.retrieval_top_k,
+                llm_manager=self.llm_manager,
+            )
+
+        # 跨语言混合搜索
+        if self.cross_lingual_enabled and self.hybrid_search_enabled:
+            logger.info("使用跨语言混合搜索")
+            return self.vector_store.cross_lingual_hybrid_search(
+                question,
+                k=self.retrieval_top_k,
+                dense_weight=self.hybrid_dense_weight,
+                sparse_weight=self.hybrid_sparse_weight,
+            )
+
+        # 普通混合搜索
+        if self.hybrid_search_enabled:
+            logger.info("使用混合搜索（向量 + BM25）")
+            return self.vector_store.hybrid_search(
+                question,
+                k=self.retrieval_top_k,
+                dense_weight=self.hybrid_dense_weight,
+                sparse_weight=self.hybrid_sparse_weight,
+            )
+
+        # 带阈值的相似度搜索
+        if self.score_threshold > 0:
+            docs_with_scores = self.vector_store.similarity_search_with_score(
+                question, k=self.retrieval_top_k
+            )
+            return [
+                doc
+                for doc, score in docs_with_scores
+                if score <= self.score_threshold
+            ]
+
+        # 基础相似度搜索（兜底）
+        return self.vector_store.similarity_search(question, k=self.retrieval_top_k)
+
+
 
     def _build_context(self, documents: List[Document]) -> str:
         """构建上下文"""

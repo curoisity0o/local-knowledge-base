@@ -4,7 +4,7 @@ RAG Agent
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .base_agent import AgentConfig, AgentState, BaseAgent
 
@@ -43,36 +43,51 @@ class RAGAgent(BaseAgent):
         return """你是一个智能问答助手，专门基于提供的知识库内容回答用户问题。
 
 工作流程：
-1. 首先理解用户问题
-2. 使用搜索工具在知识库中查找相关内容
-3. 基于找到的内容回答问题
-4. 如果知识库中没有相关信息，明确告知用户
+1. 首先理解用户问题，判断是否是复杂多跳问题
+2. 优先使用 hybrid_search 进行混合搜索获取更准确的结果
+3. 若问题需要更多上下文，使用 parent_context_search
+4. 基于找到的内容回答问题
+5. 如果知识库中没有相关信息，明确告知用户
 
 回答要求：
 - 只基于知识库中的内容回答，不要编造信息
 - 如果找到多个相关文档，综合这些文档的内容回答
 - 引用来源时说明来自哪个文档
-- 回答要简洁准确
-
-如果需要执行搜索，请使用 search_knowledge 工具。"""
+- 回答要简洁准确"""
 
     def _init_tools(self) -> None:
         """初始化工具"""
         from .tools import (
+            create_hybrid_search_tool,
             create_list_documents_tool,
+            create_parent_context_tool,
             create_retrieve_documents_tool,
             create_search_tool,
         )
 
         if self.vector_store:
-            # 搜索工具
+            # 混合搜索工具（优先推荐）
+            self.register_tool(
+                "hybrid_search",
+                create_hybrid_search_tool(self.vector_store),
+                "混合搜索（向量+BM25），推荐优先使用",
+            )
+
+            # 父子上下文检索工具
+            self.register_tool(
+                "parent_context_search",
+                create_parent_context_tool(self.vector_store),
+                "父子上下文检索，返回更完整上下文",
+            )
+
+            # 基础搜索工具
             self.register_tool(
                 "search_knowledge",
                 create_search_tool(self.vector_store),
                 "在知识库中搜索相关文档",
             )
 
-            # 检索工具
+            # 带分数的检索工具
             self.register_tool(
                 "retrieve_documents",
                 create_retrieve_documents_tool(self.vector_store),
@@ -95,7 +110,7 @@ class RAGAgent(BaseAgent):
             # 添加用户消息
             self.add_message("user", input_data)
 
-            # 1. 检索相关文档
+            # 1. 检索相关文档（优先使用混合搜索）
             self.set_state(AgentState.ACTING)
             context = self._retrieve_context(input_data)
 
@@ -119,12 +134,21 @@ class RAGAgent(BaseAgent):
             return {"success": False, "error": str(e), "query": input_data}
 
     def _retrieve_context(self, query: str) -> str:
-        """检索上下文"""
+        """检索上下文，优先使用混合搜索"""
         try:
-            # 使用相似度搜索
             if not self.vector_store:
                 return ""
-            results = self.vector_store.similarity_search(query, k=self.retrieval_top_k)
+
+            # 优先使用混合搜索（向量 + BM25）
+            try:
+                results = self.vector_store.hybrid_search(
+                    query, k=self.retrieval_top_k
+                )
+            except (AttributeError, RuntimeError, ValueError):
+                # 降级到普通相似度搜索
+                results = self.vector_store.similarity_search(
+                    query, k=self.retrieval_top_k
+                )
 
             if not results:
                 return ""
@@ -249,6 +273,169 @@ class RAGAgent(BaseAgent):
             return {"success": False, "error": str(e)}
 
 
+class MultiStepRAGAgent(RAGAgent):
+    """多步推理RAG Agent：通过 ReAct 模式自主选择工具、分解问题并综合答案。
+
+    适合处理复杂的多跳问题，例如：
+    - 需要比较多个文档的问题
+    - 需要先检索摘要再深入搜索的问题
+    - 需要拆解为子问题分别回答的问题
+    """
+
+    def __init__(
+        self,
+        config: Optional[AgentConfig] = None,
+        llm_manager=None,
+        vector_store=None,
+    ):
+        if config is None:
+            config = AgentConfig(
+                name="multi_step_rag_agent",
+                description="多步推理RAG Agent，适合复杂多跳问题",
+                max_iterations=8,
+                system_prompt=self._get_multi_step_system_prompt(),
+            )
+
+        super().__init__(config, llm_manager, vector_store)
+
+        # 注册查询分解工具
+        from .tools import create_knowledge_summary_tool, create_query_decompose_tool
+
+        self.register_tool(
+            "decompose_query",
+            create_query_decompose_tool(llm_manager),
+            "将复杂问题分解为子问题",
+        )
+
+        if vector_store:
+            self.register_tool(
+                "knowledge_summary",
+                create_knowledge_summary_tool(vector_store, llm_manager),
+                "对指定主题生成知识库综合摘要",
+            )
+
+        self.retrieval_top_k = 6
+
+    def _get_multi_step_system_prompt(self) -> str:
+        return """你是一个高级研究分析助手，擅长处理复杂的多步骤问题。
+
+可用工具：
+- hybrid_search(query, k): 混合搜索（推荐）
+- parent_context_search(query, k): 父子上下文检索
+- search_knowledge(query, k): 基础搜索
+- decompose_query(query): 将复杂问题分解为子问题
+- knowledge_summary(topic, max_docs): 对主题生成综合摘要
+- list_documents(): 列出知识库中的文档
+
+工作策略：
+1. 分析问题复杂度，决定是否需要分解
+2. 对复杂问题先用 decompose_query 拆分，再分别检索
+3. 优先使用 hybrid_search 提升检索质量
+4. 需要上下文时使用 parent_context_search
+5. 综合所有检索结果给出完整答案
+
+回答要求：
+- 答案结构清晰，如有多个子问题应分点作答
+- 明确引用来源文档
+- 不编造信息"""
+
+    def process(self, input_data: str) -> Dict[str, Any]:
+        """通过多步骤 ReAct 循环处理复杂查询"""
+        self.set_state(AgentState.THINKING)
+        self._iteration_count = 0
+
+        try:
+            self.add_message("user", input_data)
+
+            # 阶段1：判断是否需要分解
+            is_complex = self._is_complex_query(input_data)
+
+            collected_contexts: List[str] = []
+
+            if is_complex and self.llm_manager:
+                # 阶段2：分解问题
+                self.set_state(AgentState.ACTING)
+                sub_questions = self._decompose_query(input_data)
+
+                # 阶段3：逐一检索子问题
+                for sub_q in sub_questions:
+                    if self.check_iteration_limit():
+                        break
+                    ctx = self._retrieve_context(sub_q)
+                    if ctx:
+                        collected_contexts.append(f"## 子问题: {sub_q}\n{ctx}")
+            else:
+                # 简单问题直接检索
+                self.set_state(AgentState.ACTING)
+                ctx = self._retrieve_context(input_data)
+                if ctx:
+                    collected_contexts.append(ctx)
+
+            # 阶段4：综合生成答案
+            self.set_state(AgentState.THINKING)
+            combined_context = "\n\n".join(collected_contexts)
+            response = self._generate_response(input_data, combined_context)
+
+            self.set_state(AgentState.RESPONDING)
+            self.add_message("assistant", response)
+
+            return {
+                "success": True,
+                "query": input_data,
+                "response": response,
+                "context_used": bool(combined_context),
+                "iterations": self._iteration_count,
+                "sub_questions": sub_questions if is_complex and self.llm_manager else [],
+            }
+
+        except Exception as e:
+            logger.error(f"MultiStepRAGAgent处理失败: {e}")
+            self.set_state(AgentState.ERROR)
+            return {"success": False, "error": str(e), "query": input_data}
+
+    def _is_complex_query(self, query: str) -> bool:
+        """启发式判断是否为复杂查询。
+
+        触发条件（满足任一即视为复杂）：
+        1. 查询字数超过 30 个字符（通常意味着包含多个约束条件）
+        2. 包含比较/关系/分析类关键词（如"比较"、"区别"、"分析"等），
+           这类词语通常意味着需要多个文档片段才能完整回答。
+        """
+        complex_indicators = [
+            "比较", "对比", "区别", "联系", "关系",
+            "分析", "总结", "综述", "哪些", "哪几",
+            "compare", "difference", "relationship", "analyze",
+            "和", "与", "及", "以及",
+        ]
+        return (
+            len(query) > 30
+            or any(ind in query for ind in complex_indicators)
+        )
+
+    def _decompose_query(self, query: str) -> List[str]:
+        """将复杂查询分解为子问题"""
+        if not self.llm_manager:
+            return [query]
+
+        try:
+            prompt = (
+                f"请将以下复杂问题分解为2-4个简单的子问题，每行一个，"
+                f"直接输出子问题，不要编号或解释。\n\n复杂问题：{query}"
+            )
+            result = self.llm_manager.generate(prompt)
+            text = result.get("text", "").strip()
+            sub_questions = [
+                line.strip() for line in text.splitlines() if line.strip()
+            ]
+            if sub_questions:
+                logger.info(f"问题分解为 {len(sub_questions)} 个子问题")
+                return sub_questions[:4]  # 最多4个子问题
+        except Exception as e:
+            logger.warning(f"问题分解失败: {e}")
+
+        return [query]
+
+
 class ResearchAgent(RAGAgent):
     """研究分析Agent - 更适合复杂分析任务"""
 
@@ -272,7 +459,7 @@ class ResearchAgent(RAGAgent):
 
 你的工作：
 1. 深入分析用户提出的问题
-2. 在知识库中检索所有相关内容
+2. 在知识库中检索所有相关内容（优先使用 hybrid_search）
 3. 综合分析多个文档的信息
 4. 提供详细、结构化的回答
 5. 如果需要，可以进行比较、总结、推理
@@ -377,3 +564,12 @@ def create_rag_agent(
 def create_research_agent(llm_manager=None, vector_store=None) -> ResearchAgent:
     """创建研究Agent"""
     return ResearchAgent(llm_manager=llm_manager, vector_store=vector_store)
+
+
+def create_multi_step_agent(
+    llm_manager=None, vector_store=None
+) -> MultiStepRAGAgent:
+    """创建多步推理Agent"""
+    return MultiStepRAGAgent(llm_manager=llm_manager, vector_store=vector_store)
+
+

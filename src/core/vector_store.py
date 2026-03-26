@@ -862,6 +862,131 @@ class SimpleVectorStore:
             logger.error(f"获取所有源文件路径失败: {e}")
             return []
 
+    def parent_child_search(self, query: str, k: int = 4) -> List[Document]:
+        """父子上下文检索：命中子块，返回父块内容以提供更完整上下文。
+
+        当文档以父子分块方式摄入（metadata 中含 parent_content）时，
+        此方法会检索精准的子块，然后将结果扩展为父块内容，
+        从而在高精度召回的同时保留足够的上下文。
+
+        若子块不包含 parent_content，则直接返回子块。
+
+        Args:
+            query: 查询文本
+            k: 返回结果数量
+
+        Returns:
+            包含父块（或子块）内容的 Document 列表
+        """
+        self._ensure_initialized()
+
+        if self.vector_store is None:
+            return []
+
+        try:
+            # 检索子块（多取一些，父块去重后可能减少）
+            child_docs = self.similarity_search(query, k=k * 2)
+
+            seen_parent_ids: set = set()
+            result_docs: List[Document] = []
+
+            for child in child_docs:
+                parent_id = child.metadata.get("parent_id")
+                parent_content = child.metadata.get("parent_content")
+
+                if parent_id and parent_content:
+                    # 父子分块模式：用父块内容替换子块内容，并去重
+                    if parent_id not in seen_parent_ids:
+                        seen_parent_ids.add(parent_id)
+                        parent_meta = dict(child.metadata)
+                        parent_meta.pop("parent_content", None)  # 避免嵌套
+                        result_docs.append(
+                            Document(
+                                page_content=parent_content, metadata=parent_meta
+                            )
+                        )
+                else:
+                    # 普通分块模式：直接返回子块
+                    result_docs.append(child)
+
+                if len(result_docs) >= k:
+                    break
+
+            logger.info(
+                "父子上下文检索完成: query='%s...', 返回 %d 个结果",
+                query[:30],
+                len(result_docs),
+            )
+            return result_docs
+
+        except Exception as e:
+            logger.error(f"父子上下文检索失败: {e}")
+            return self.similarity_search(query, k=k)
+
+    def multi_query_search(
+        self,
+        query: str,
+        k: int = 4,
+        llm_manager=None,
+        num_queries: int = 3,
+    ) -> List[Document]:
+        """多查询检索：用 LLM 生成查询变体，分别检索后用 RRF 合并去重。
+
+        当某个查询角度未能召回相关文档时，换角度的查询变体可补充覆盖，
+        从而提升整体召回率。
+
+        Args:
+            query: 原始查询
+            k: 最终返回结果数量
+            llm_manager: LLMManager 实例，用于生成变体（可选）
+            num_queries: 生成的查询变体数量
+
+        Returns:
+            融合后的 Document 列表
+        """
+        self._ensure_initialized()
+
+        if self.vector_store is None:
+            return []
+
+        query_variants: List[str] = [query]
+
+        # 尝试用 LLM 生成多个查询变体
+        if llm_manager is not None:
+            try:
+                prompt = (
+                    f"请为以下问题生成 {num_queries} 个不同角度的查询语句，"
+                    f"每行一个，直接输出查询语句，不要编号或解释。\n\n问题：{query}"
+                )
+                result = llm_manager.generate(prompt)
+                text = result.get("text", "")
+                variants = [
+                    line.strip()
+                    for line in text.splitlines()
+                    if line.strip() and line.strip() != query
+                ][:num_queries]
+                if variants:
+                    query_variants.extend(variants)
+                    logger.info("生成查询变体: %s", variants)
+            except (RuntimeError, ValueError, AttributeError, KeyError) as e:
+                logger.warning(f"生成查询变体失败，使用原始查询: {e}")
+
+        # 对每个变体执行相似度搜索，收集结果列表
+        all_result_lists: List[List[Tuple[Document, float]]] = []
+        for variant in query_variants:
+            docs_with_scores = self.similarity_search_with_score(variant, k=k)
+            if docs_with_scores:
+                all_result_lists.append(docs_with_scores)
+
+        if not all_result_lists:
+            return []
+
+        # 使用 RRF 融合多路结果
+        merged = reciprocal_rank_fusion(all_result_lists)
+        return merged[:k]
+
+
+
 
 # 便捷函数
 def create_vector_store(config=None) -> SimpleVectorStore:
