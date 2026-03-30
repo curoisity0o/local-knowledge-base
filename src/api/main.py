@@ -53,6 +53,7 @@ app.add_middleware(
 _processor = None
 _vector_store = None
 _llm_manager = None
+_rag_chain = None
 _init_lock = threading.Lock()
 
 
@@ -84,6 +85,19 @@ def get_llm_manager():
             if _llm_manager is None:
                 _llm_manager = LLMManager()
     return _llm_manager
+
+
+def get_rag_chain():
+    """获取 RAGChain 实例（线程安全）"""
+    global _rag_chain
+    if _rag_chain is None:
+        with _init_lock:
+            if _rag_chain is None:
+                from src.core.rag_chain import RAGChain
+
+                _rag_chain = RAGChain()
+                _rag_chain.initialize()
+    return _rag_chain
 
 
 # 请求/响应模型
@@ -397,122 +411,56 @@ async def check_vectorstore() -> dict:
 
 @app.post("/api/v1/query", response_model=QueryResponse)
 async def query_knowledge_base(request: QueryRequest):
-    """查询知识库"""
+    """查询知识库 — 委托给 RAGChain 完整检索管线"""
     import time
 
     start_time = time.time()
 
     try:
-        llm_manager = get_llm_manager()
-        vector_store = get_vector_store()
-
         if request.use_rag:
-            # RAG 模式：检索 + 生成
-            # 1. 检索相关文档
-            retrieved_docs = vector_store.similarity_search(
-                request.question, k=request.top_k or 4
+            # RAG 模式：通过 RAGChain 走完整检索管线
+            # （hybrid search / parent-child / reranking 等按配置生效）
+            from src.core.rag_chain import RAGChain
+
+            rag_chain = get_rag_chain()
+            rag_result = rag_chain.query(
+                question=request.question,
+                history=request.history or [],
+                provider=request.provider,
+                top_k=request.top_k,
             )
 
-            if retrieved_docs:
-                # 构建上下文 - 对来源去重，保留首次出现的 chunk
-                seen_sources = set()
-                unique_docs = []
-                for doc in retrieved_docs:
-                    source = doc.metadata.get("source", "未知")
-                    if source not in seen_sources:
-                        seen_sources.add(source)
-                        unique_docs.append(doc)
-
-                # 如果去重后文档太少，补充一些非重复的 chunk
-                if len(unique_docs) < 2:
-                    for doc in retrieved_docs:
-                        if doc not in unique_docs:
-                            unique_docs.append(doc)
-                            if len(unique_docs) >= 2:
-                                break
-
-                # 构建上下文
-                context = "\n\n".join(
-                    [
-                        f"[来源 {i + 1}]: {doc.page_content}"
-                        for i, doc in enumerate(unique_docs)
-                    ]
-                )
-
-                # 构建提示词
-                # 根据问题类型调整 prompt
-                question = request.question.lower()
-                is_short_fact = any(
-                    kw in question
-                    for kw in [
-                        "多久",
-                        "多少",
-                        "多长时间",
-                        "takes",
-                        "耗时",
-                        "时间",
-                        "ms",
-                        "秒",
-                    ]
-                )
-
-                # 构建带历史的提示词
-                prompt = _build_prompt_with_history(
-                    question=request.question,
-                    context=context,
-                    history=request.history or [],
-                    is_short_fact=is_short_fact,
-                )
-
-                # 2. 生成答案
-                result = llm_manager.generate(prompt, provider=request.provider)
-
-                answer = result["text"]
-                # 返回去重后的来源
-                sources = list(seen_sources)
-            else:
-                # 无相关文档，直接回答
-                history_context = _build_history_context(request.history or [])
-                if history_context:
-                    prompt = f"""【对话历史】
-{history_context}
-
-用户问题：{request.question}
-
-请结合对话历史和你的知识回答。如果历史中也没有相关信息，请如实说明。"""
-                    result = llm_manager.generate(prompt, provider=request.provider)
-                else:
-                    result = llm_manager.generate(
-                        request.question, provider=request.provider
-                    )
-                answer = result["text"]
-                sources = []
+            answer = rag_result.get("answer", "生成失败")
+            sources = rag_result.get("sources", [])
+            metadata = rag_result.get("metadata", {})
+            provider_used = metadata.get("provider", "unknown")
+            tokens = rag_result.get("tokens")
         else:
-            # 直接生成模式
+            # 直接生成模式（不检索）
+            llm_manager = get_llm_manager()
             history_context = _build_history_context(request.history or [])
             if history_context:
-                prompt = f"""【对话历史】
-{history_context}
-
-用户问题：{request.question}
-
-请结合对话历史和你的知识回答。"""
-                result = llm_manager.generate(prompt, provider=request.provider)
-            else:
-                result = llm_manager.generate(
-                    request.question, provider=request.provider
+                prompt = (
+                    f"【对话历史】\n{history_context}\n\n"
+                    f"用户问题：{request.question}\n\n"
+                    f"请结合对话历史和你的知识回答。"
                 )
+            else:
+                prompt = request.question
+            result = llm_manager.generate(prompt, provider=request.provider)
             answer = result["text"]
             sources = []
+            provider_used = result.get("metadata", {}).get("provider", "unknown")
+            tokens = result.get("tokens")
 
         response_time = time.time() - start_time
 
         return QueryResponse(
             answer=answer,
             sources=sources,
-            provider=result.get("metadata", {}).get("provider", "unknown"),
+            provider=provider_used,
             response_time=response_time,
-            tokens_used=result.get("tokens"),
+            tokens_used=tokens,
         )
 
     except Exception as e:

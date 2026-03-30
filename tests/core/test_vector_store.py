@@ -190,7 +190,7 @@ class TestReciprocalRankFusion:
         result = reciprocal_rank_fusion([list1, list2], k=60)
 
         # B在两个列表中都排第一，应该排第一
-        assert result[0].page_content == "文档B" * 50
+        assert result[0][0].page_content == "文档B" * 50
 
     def test_rrf_deduplication(self):
         """测试去重功能"""
@@ -218,5 +218,5 @@ class TestReciprocalRankFusion:
 
         # 两个结果的顺序可能不同
         # 文档0应该都在第一位
-        assert result_k1[0].page_content == "文档0"
-        assert result_k100[0].page_content == "文档0"
+        assert result_k1[0][0].page_content == "文档0"
+        assert result_k100[0][0].page_content == "文档0"

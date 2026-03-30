@@ -29,7 +29,7 @@ document_processing:
     chunk_overlap: "${CHUNK_OVERLAP:-100}"
     max_chunks_per_doc: "${MAX_CHUNKS_PER_DOC:-100}"
     # 父子分块配置（父块提供完整上下文，子块用于精准检索）
-    use_parent_child: false          # 设为 true 以启用父子分块模式
+    use_parent_child: true          # 设为 true 以启用父子分块模式
     parent_chunk_size: 1500          # 父块大小（字符数）
     child_chunk_size: 400            # 子块大小（字符数）
     
@@ -116,22 +116,17 @@ embeddings:
 # RAG配置
 rag:
   retriever:
-    type: "hybrid"  # hybrid, dense, sparse
-    top_k: 10       # 增加到10，提升召回率
-    score_threshold: 0.5  # 降低阈值，匹配更多结果
-    
-    dense:
-      search_type: "similarity"  # similarity, mmr
-      fetch_k: 20
-      
+    type: "hybrid"  # hybrid, dense, sparse — 由 RAGChain._retrieve_documents 读取
+    top_k: 10       # 由 RAGChain 读取
+    score_threshold: 0.5  # 最低相似度阈值（L2距离已转换为相似度），由 RAGChain 读取
+
     sparse:
-      bm25_k1: 1.5
-      bm25_b: 0.75
-      
+      bm25_k1: 1.5  # 由 SimpleVectorStore._get_bm25_index 读取
+      bm25_b: 0.75  # 由 SimpleVectorStore._get_bm25_index 读取
+
     hybrid:
-      fusion_method: "weighted"  # weighted, reciprocal_rank_fusion
-      dense_weight: 0.7
-      sparse_weight: 0.3
+      dense_weight: 0.7  # 由 RAGChain 读取
+      sparse_weight: 0.3  # 由 RAGChain 读取
 
     # 父子上下文检索（需要文档以父子分块方式摄入）
     parent_child:

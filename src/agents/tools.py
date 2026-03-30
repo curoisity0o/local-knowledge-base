@@ -341,35 +341,6 @@ def create_calculator_tool() -> Callable:
     return calculate
 
 
-def create_summary_tool() -> Callable:
-    """创建文本摘要工具（简单版本）"""
-
-    def summarize(text: str, max_length: int = 200) -> str:
-        """
-        生成文本摘要
-
-        参数:
-            text: 要摘要的文本
-            max_length: 摘要最大长度
-        """
-        # 简单实现：取前N个字符
-        if len(text) <= max_length:
-            return text
-
-        # 尝试在句号处截断
-        truncated = text[:max_length]
-        last_period = truncated.rfind("。")
-        last_newline = truncated.rfind("\n")
-
-        cut_point = max(last_period, last_newline)
-        if cut_point > max_length * 0.7:  # 至少70%长度
-            return text[: cut_point + 1]
-
-        return truncated + "..."
-
-    return summarize
-
-
 def create_hybrid_search_tool(vector_store) -> Callable:
     """创建混合搜索工具（向量 + BM25 融合），比纯向量搜索更准确"""
 
@@ -659,24 +630,6 @@ def get_default_tools(
                 "expression": {"type": "string", "description": "数学表达式"}
             },
             "required": ["expression"],
-        },
-    )
-
-    # 摘要工具
-    registry.register(
-        "summarize",
-        create_summary_tool(),
-        description="生成文本摘要（简单截断版，建议用 knowledge_summary 代替）",
-        parameters={
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "要摘要的文本"},
-                "max_length": {
-                    "type": "integer",
-                    "description": "摘要最大长度，默认200",
-                },
-            },
-            "required": ["text"],
         },
     )
 

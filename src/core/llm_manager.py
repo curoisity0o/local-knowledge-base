@@ -5,6 +5,7 @@
 
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,23 @@ except ImportError:
 from .config import get_config
 
 logger = logging.getLogger(__name__)
+
+
+# 中文字符模式（CJK 统一表意文字）
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]")
+
+
+def estimate_tokens(text: str) -> int:
+    """按语言分别估算 token 数量。
+
+    - 中文字符：每个约 1-2 token，取均值 1.5
+    - 英文/其他：按 word 级别，每 ~1.3 个字符约 1 token（约 4 字符/token）
+    """
+    if not text:
+        return 0
+    cjk_count = len(_CJK_PATTERN.findall(text))
+    non_cjk_len = len(text) - cjk_count
+    return int(cjk_count * 1.5 + non_cjk_len / 4)
 
 
 class LLMManager:
@@ -448,9 +466,9 @@ class LLMManager:
         try:
             response = self.local_llm.invoke(prompt, **kwargs)
 
-            # 简单 token 计数（近似）
-            input_tokens = len(prompt) // 4  # 近似值
-            output_tokens = len(response) // 4
+            # Token 计数（按语言分别估算）
+            input_tokens = estimate_tokens(prompt)
+            output_tokens = estimate_tokens(response)
 
             return {
                 "text": response,
@@ -478,8 +496,8 @@ class LLMManager:
                         response += str(chunk)
 
                 # 流式模式下使用近似 token 计数
-                input_tokens = len(prompt) // 4  # 近似值
-                output_tokens = len(response) // 4
+                input_tokens = estimate_tokens(prompt)
+                output_tokens = estimate_tokens(response)
             else:
                 response_obj = client.invoke(prompt, **kwargs)
                 response = (
@@ -488,9 +506,9 @@ class LLMManager:
                     else str(response_obj)
                 )
 
-                # 获取 token 使用情况
-                input_tokens = len(prompt) // 4  # 近似值
-                output_tokens = len(response) // 4
+                # 获取 token 使用情况（近似值，API 返回后用实际值覆盖）
+                input_tokens = estimate_tokens(prompt)
+                output_tokens = estimate_tokens(response)
 
                 # 尝试从响应中获取实际 token 计数
                 if hasattr(response_obj, "usage"):

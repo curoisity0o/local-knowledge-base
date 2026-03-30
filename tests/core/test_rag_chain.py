@@ -128,11 +128,17 @@ class TestRAGChainQuery:
     @patch("src.core.rag_chain.SimpleVectorStore")
     @patch("src.core.rag_chain.DocumentProcessor")
     def test_query_empty_knowledge_base(self, mock_doc_proc, mock_vs, mock_llm):
-        """测试空知识库查询"""
-        # Mock vector store returns empty
+        """测试空知识库查询 — 无检索结果时调用 LLM 直接回答"""
         mock_vs_instance = MagicMock()
         mock_vs_instance.similarity_search.return_value = []
         mock_vs.return_value = mock_vs_instance
+
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate.return_value = {
+            "text": "我不知道",
+            "metadata": {"provider": "local"},
+        }
+        mock_llm.return_value = mock_llm_instance
 
         chain = RAGChain()
         chain.initialize()
@@ -140,8 +146,10 @@ class TestRAGChainQuery:
         result = chain.query("什么是AI？")
 
         assert result["success"] is True
-        assert "知识库为空" in result["answer"]
+        assert result["answer"] == "我不知道"
         assert result["num_sources"] == 0
+        # 无检索结果时应调用 LLM
+        mock_llm_instance.generate.assert_called_once()
 
     @pytest.mark.skip(reason="Integration test - requires full mocking setup")
     @patch("src.core.rag_chain.LLMManager")

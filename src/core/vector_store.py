@@ -66,20 +66,29 @@ class LanguageDetector:
         lang = self.detect(text)
         return lang in ["zh-cn", "zh-tw", "zh-hans", "zh-hant"]
 
-    def is_english(self, text: str) -> bool:
-        """判断是否为英文"""
-        return self.detect(text) == "en"
 
 
 class QueryTranslator:
-    """Query翻译器 - 用于跨语言检索"""
+    """Query 双向翻译器 — 支持中英文互译，带 LRU 缓存。
+
+    翻译失败或 LLM 不可用时返回原始查询（零开销降级）。
+    """
+
+    # 翻译方向
+    ZH_TO_EN = "en"
+    EN_TO_ZH = "zh"
 
     def __init__(self):
         self._llm = None
         self._enabled = get_config("rag.cross_lingual.translation_enabled", True)
+        # LRU 缓存: query → translated query
+        self._cache: Dict[str, str] = {}
+        self._max_cache_size = int(
+            get_config("rag.cross_lingual.cache_size", 100)
+        )
 
     def _get_llm(self):
-        """获取翻译用的LLM"""
+        """延迟初始化翻译 LLM"""
         if self._llm is None:
             try:
                 from langchain_ollama import OllamaLLM
@@ -92,40 +101,63 @@ class QueryTranslator:
                 self._enabled = False
         return self._llm
 
+    def _add_to_cache(self, query: str, translated: str) -> None:
+        """添加到缓存，超出上限时淘汰最早的条目"""
+        if len(self._cache) >= self._max_cache_size:
+            # 删除最早的一个条目
+            oldest_key = next(iter(self._cache))
+            del self._cache[oldest_key]
+        self._cache[query] = translated
+
     def translate(self, query: str, target_lang: str = "en") -> str:
         """
-        翻译Query
+        翻译查询。
 
         Args:
             query: 原始查询
-            target_lang: 目标语言 (默认英文)
+            target_lang: 目标语言 ("en" 或 "zh")
 
         Returns:
-            翻译后的查询
+            翻译后的查询，失败时返回原始查询
         """
-        if not self._enabled:
+        if not self._enabled or not query.strip():
             return query
+
+        cache_key = f"{target_lang}:{query}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
         llm = self._get_llm()
         if llm is None:
             return query
 
+        lang_name = "英文" if target_lang == "en" else "中文"
         try:
-            prompt = f"""Translate the following text to {target_lang}.
-Only output the translation, nothing else.
+            prompt = f"""将以下文本翻译为{lang_name}，只输出翻译结果，不要其他内容。
 
-Text: {query}
+文本：{query}
 
-Translation:"""
+翻译："""
+            result = llm.invoke(prompt).strip()
+            if not result or result == query:
+                return query
 
-            result = llm.invoke(prompt)
-            # 清理结果
-            result = result.strip()
-            logger.info(f"Query翻译: '{query[:30]}...' -> '{result[:30]}...'")
+            self._add_to_cache(query, result)
+            logger.info(
+                f"Query翻译: '{query[:30]}...' -> '{result[:30]}...'"
+            )
             return result
         except Exception as e:
             logger.warning(f"Query翻译失败: {e}")
             return query
+
+    def translate_to_en(self, query: str) -> str:
+        """中文查询 → 英文翻译（命中缓存则直接返回）"""
+        return self.translate(query, target_lang=self.ZH_TO_EN)
+
+    def translate_to_zh(self, query: str) -> str:
+        """英文查询 → 中文翻译（命中缓存则直接返回）"""
+        return self.translate(query, target_lang=self.EN_TO_ZH)
 
 
 # 全局实例
@@ -167,11 +199,22 @@ class BM25:
         self._indexed = False
 
     def _tokenize(self, text: str) -> List[str]:
-        """简单分词（按空格和标点）"""
-        # 中英文混合分词
-        tokens = re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z]+|\d+|[^\s\w]", text.lower())
-        # 过滤单字符和纯数字
-        return [t for t in tokens if len(t) > 1 or re.search(r"[\u4e00-\u9fff]", t)]
+        """分词：中文用 jieba，英文用空格分割。jieba 未安装时 fallback 到正则。"""
+        text_lower = text.lower()
+        if re.search(r"[\u4e00-\u9fff]", text_lower):
+            try:
+                import jieba
+                tokens = list(jieba.cut(text_lower))
+            except ImportError:
+                # fallback：正则分词
+                tokens = re.findall(
+                    r"[\u4e00-\u9fff]+|[a-zA-Z]+|\d+", text_lower
+                )
+        else:
+            tokens = text_lower.split()
+
+        # 过滤停用词、单字符空白、纯数字
+        return [t for t in tokens if len(t) > 1 and not t.isspace() and not t.isdigit()]
 
     def _calculate_idf(self):
         """计算IDF"""
@@ -247,7 +290,7 @@ class BM25:
 
 def reciprocal_rank_fusion(
     result_lists: List[List[Tuple[Document, float]]], k: int = 60
-) -> List[Document]:
+) -> List[Tuple[Document, float]]:
     """
     倒数排名融合 (Reciprocal Rank Fusion)
 
@@ -259,14 +302,14 @@ def reciprocal_rank_fusion(
         k: 融合参数，通常设置为60
 
     Returns:
-        融合后的文档列表（按融合分数降序）
+        融合后的 [(文档, RRF分数)] 列表（按融合分数降序）
     """
     doc_scores: Dict[str, Tuple[float, Document]] = {}
 
     for result_list in result_lists:
         for rank, (doc, _) in enumerate(result_list):
-            # 使用文档内容作为唯一标识（避免ID不一致问题）
-            doc_key = doc.page_content[:100]  # 取前100字符作为key
+            # 使用完整内容作为唯一标识，避免前缀碰撞
+            doc_key = doc.page_content
             # RRF公式: 1 / (k + rank)
             rrf_score = 1.0 / (k + rank + 1)
             if doc_key in doc_scores:
@@ -277,11 +320,75 @@ def reciprocal_rank_fusion(
     # 按RRF分数排序
     sorted_docs = sorted(doc_scores.values(), key=lambda x: x[0], reverse=True)
 
-    # 返回排序后的文档列表
-    results = [doc for _, doc in sorted_docs]
+    logger.info(f"RRF融合完成: {len(result_lists)} 个结果列表 -> {len(sorted_docs)} 个文档")
+    return [(doc, score) for score, doc in sorted_docs]
 
-    logger.info(f"RRF融合完成: {len(result_lists)} 个结果列表 -> {len(results)} 个文档")
-    return results
+
+class KeywordCoverageReranker:
+    """轻量级重排序器 — 基于查询关键词在文档中的覆盖率评分。
+
+    零额外模型依赖，适合无法加载 CrossEncoder 的场景。
+    """
+
+    @staticmethod
+    def _extract_keywords(query: str) -> List[str]:
+        """从查询中提取关键词"""
+        # 用 BM25 同款分词逻辑提取
+        text_lower = query.lower()
+        if re.search(r"[\u4e00-\u9fff]", text_lower):
+            try:
+                import jieba
+                tokens = list(jieba.cut(text_lower))
+            except ImportError:
+                tokens = re.findall(
+                    r"[\u4e00-\u9fff]+|[a-zA-Z]+|\d+", text_lower
+                )
+        else:
+            tokens = text_lower.split()
+        # 过滤停用词和单字符
+        stopwords = {
+            "的", "了", "是", "在", "有", "和", "与", "或", "不", "也",
+            "都", "就", "要", "会", "能", "可以", "什么", "怎么", "如何",
+            "为什么", "哪", "哪些", "这个", "那个", "一个", "the", "a",
+            "an", "is", "are", "was", "were", "be", "been", "being", "have",
+            "has", "had", "do", "does", "did", "will", "would", "could",
+            "should", "may", "might", "can", "to", "of", "in", "for", "on",
+            "with", "at", "by", "from", "as", "into", "about", "how",
+            "what", "which", "who", "when", "where", "why",
+        }
+        return [t for t in tokens if len(t) > 1 and t not in stopwords]
+
+    @staticmethod
+    def compute_score(query: str, document: Document) -> float:
+        """计算查询关键词在文档中的覆盖率分数 (0~1)。
+
+        score = 匹配的关键词数 / 总关键词数
+        """
+        keywords = KeywordCoverageReranker._extract_keywords(query)
+        if not keywords:
+            return 0.0
+
+        doc_lower = document.page_content.lower()
+        matched = sum(1 for kw in keywords if kw in doc_lower)
+        return matched / len(keywords)
+
+    def rerank(
+        self, query: str, documents: List[Document], top_n: int = 3
+    ) -> List[Document]:
+        """按关键词覆盖率重排序"""
+        if not documents:
+            return []
+
+        scored = [
+            (doc, self.compute_score(query, doc)) for doc in documents
+        ]
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        result = [doc for doc, _ in scored[:top_n]]
+        logger.info(
+            f"关键词覆盖率重排序: {len(documents)} -> {len(result)} 个文档"
+        )
+        return result
 
 
 class Reranker:
@@ -466,6 +573,8 @@ class SimpleVectorStore:
             logger.info(f"添加 {len(documents)} 个文档到向量存储")
             ids = self.vector_store.add_documents(documents)
             logger.info(f"文档添加成功，生成 {len(ids)} 个向量")
+            # 新增文档后 BM25 索引需要重建
+            self._bm25_cache = None
             return ids
         except Exception as e:
             logger.error(f"添加文档失败: {e}")
@@ -475,7 +584,6 @@ class SimpleVectorStore:
         """相似度搜索"""
         self._ensure_initialized()
 
-        # 确保向量存储已初始化
         if self.vector_store is None:
             logger.error("向量存储未正确初始化")
             return []
@@ -495,7 +603,6 @@ class SimpleVectorStore:
         """带分数的相似度搜索"""
         self._ensure_initialized()
 
-        # 确保向量存储已初始化
         if self.vector_store is None:
             logger.error("向量存储未正确初始化")
             return []
@@ -544,29 +651,12 @@ class SimpleVectorStore:
             )
             logger.info(f"稠密检索: {len(dense_results)} 个结果")
 
-            # 2. 稀疏检索（BM25）- 准备BM25索引
-            # 获取所有文档用于BM25
+            # 2. 稀疏检索（BM25）- 使用缓存的 BM25 索引
             try:
-                if hasattr(self.vector_store, "_collection"):
-                    collection = self.vector_store._collection
-                    all_docs_result = collection.get()
-
-                    if all_docs_result and all_docs_result.get("documents"):
-                        bm25 = BM25()
-                        all_documents: List[Document] = []
-                        doc_contents = all_docs_result["documents"]
-                        metadatas = all_docs_result.get("metadatas") or []
-                        for i, content in enumerate(doc_contents):
-                            metadata = metadatas[i] if i < len(metadatas) else {}
-                            all_documents.append(
-                                Document(page_content=content, metadata=metadata)
-                            )
-
-                        bm25.index(all_documents)
-                        sparse_results = bm25.search(query, k=fetch_k)
-                        logger.info(f"稀疏检索: {len(sparse_results)} 个结果")
-                    else:
-                        sparse_results = []
+                bm25, all_documents = self._get_bm25_index()
+                if bm25 and all_documents:
+                    sparse_results = bm25.search(query, k=fetch_k)
+                    logger.info(f"稀疏检索: {len(sparse_results)} 个结果")
                 else:
                     sparse_results = []
             except Exception as e:
@@ -576,7 +666,8 @@ class SimpleVectorStore:
             # 3. RRF融合
             if sparse_results:
                 result_lists = [dense_results, sparse_results]
-                fused_docs = reciprocal_rank_fusion(result_lists, k=k)
+                fused_results = reciprocal_rank_fusion(result_lists, k=k)
+                fused_docs = [doc for doc, _ in fused_results[:k]]
             else:
                 # 无BM25结果，只用向量搜索
                 fused_docs = [doc for doc, _ in dense_results[:k]]
@@ -653,7 +744,8 @@ class SimpleVectorStore:
 
         # 4. RRF融合所有结果
         if len(all_results) > 1:
-            fused_docs = reciprocal_rank_fusion(all_results, k=k)
+            fused_results = reciprocal_rank_fusion(all_results, k=k)
+            fused_docs = [doc for doc, _ in fused_results[:k]]
         else:
             fused_docs = [doc for doc, _ in all_results[0][:k]]
 
@@ -676,7 +768,10 @@ class SimpleVectorStore:
                         Document(page_content=content, metadata=metadata)
                     )
 
-            bm25 = BM25()
+            # 从配置读取 BM25 参数
+            k1 = float(get_config("rag.retriever.sparse.bm25_k1", 1.5))
+            b = float(get_config("rag.retriever.sparse.bm25_b", 0.75))
+            bm25 = BM25(k1=k1, b=b)
             bm25.index(all_documents)
             self._bm25_cache = (bm25, all_documents)
 
@@ -697,11 +792,9 @@ class SimpleVectorStore:
         if bm25 and all_documents:
             sparse_results = bm25.search(query, k=fetch_k)
 
-        # 如果有BM25结果，融合
+        # 如果有BM25结果，融合（返回带 RRF 分数的结果）
         if sparse_results:
-            fused_docs = reciprocal_rank_fusion([dense_results, sparse_results], k=k)
-            # 返回格式转换为 [(doc, score)] 以匹配 reciprocal_rank_fusion 的输入格式
-            return [(doc, 1.0) for doc in fused_docs]
+            return reciprocal_rank_fusion([dense_results, sparse_results], k=k)
         else:
             return dense_results[:k]
 
@@ -724,12 +817,28 @@ class SimpleVectorStore:
 
         # 延迟初始化重排序器
         if self.reranker is None:
-            rerank_model = get_config("rag.reranking.model", "BAAI/bge-reranker-large")
-            self.reranker = Reranker(model_name=rerank_model)
+            try:
+                rerank_model = get_config("rag.reranking.model", "BAAI/bge-reranker-large")
+                self.reranker = Reranker(model_name=rerank_model)
+            except Exception as e:
+                logger.warning(f"CrossEncoder 初始化失败，使用轻量关键词覆盖率重排序: {e}")
+                self.reranker = KeywordCoverageReranker()
+                self._reranker_type = "keyword_coverage"
+            else:
+                self._reranker_type = "cross_encoder"
+        else:
+            self._reranker_type = getattr(self, "_reranker_type", "cross_encoder")
 
         try:
             return self.reranker.rerank(query, documents, top_n)
         except Exception as e:
+            # CrossEncoder 失败时降级到关键词覆盖率
+            if isinstance(self.reranker, Reranker):
+                logger.warning(f"CrossEncoder 重排序失败，降级到关键词覆盖率: {e}")
+                fallback = KeywordCoverageReranker()
+                self.reranker = fallback
+                self._reranker_type = "keyword_coverage"
+                return fallback.rerank(query, documents, top_n)
             logger.warning(f"重排序失败，使用原始检索结果: {e}")
             return documents[:top_n]
 
@@ -884,8 +993,11 @@ class SimpleVectorStore:
             return []
 
         try:
-            # 检索子块（多取一些，父块去重后可能减少）
-            child_docs = self.similarity_search(query, k=k * 2)
+            # 检索子块（使用混合搜索，多取一些，父块去重后可能减少）
+            try:
+                child_docs = self.hybrid_search(query, k=k * 2)
+            except Exception:
+                child_docs = self.similarity_search(query, k=k * 2)
 
             seen_parent_ids: set = set()
             result_docs: List[Document] = []
@@ -983,7 +1095,7 @@ class SimpleVectorStore:
 
         # 使用 RRF 融合多路结果
         merged = reciprocal_rank_fusion(all_result_lists)
-        return merged[:k]
+        return [doc for doc, _ in merged[:k]]
 
 
 

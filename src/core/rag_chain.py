@@ -12,7 +12,7 @@ from langchain_core.documents import Document
 
 from .config import get_config
 from .document_processor import DocumentProcessor
-from .llm_manager import LLMManager
+from .llm_manager import LLMManager, estimate_tokens
 from .vector_store import SimpleVectorStore
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,16 @@ class RAGChain:
         )
         self.retrieval_top_k = int(get_config("rag.retriever.top_k", 4))
         self.score_threshold = float(get_config("rag.retriever.score_threshold", 0.0))
+
+        # 上下文长度管理：为 context 预留的最大 token 数
+        # = 模型 context window - prompt 模板开销(约300 token) - max_tokens(生成)
+        model_context_window = int(
+            get_config("llm.local.ollama.context_window", 4096)
+        )
+        max_output_tokens = int(
+            get_config("rag.generation.max_tokens", 2000)
+        )
+        self.max_context_tokens = model_context_window - max_output_tokens - 300
 
         # 重排序配置
         self.reranking_enabled = get_config("rag.reranking.enabled", False)
@@ -171,8 +181,21 @@ class RAGChain:
             "results": results,
         }
 
-    def query(self, question: str, use_history: bool = False) -> Dict[str, Any]:
-        """查询知识库"""
+    def query(
+        self,
+        question: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        provider: Optional[str] = None,
+        top_k: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """查询知识库
+
+        Args:
+            question: 用户问题
+            history: 对话历史 [{"role": "user/assistant", "content": "..."}]
+            provider: LLM 提供者，None 则自动选择
+            top_k: 检索文档数量，None 则使用配置默认值
+        """
         if not self._initialized:
             self.initialize()
 
@@ -181,9 +204,13 @@ class RAGChain:
         try:
             logger.info(f"处理查询: {question[:50]}...")
 
+            effective_top_k = top_k if top_k is not None else self.retrieval_top_k
+
             # 1. 检索相关文档
             if self.vector_store:
-                retrieved_docs = self._retrieve_documents(question)
+                retrieved_docs = self._retrieve_documents(
+                    question, k=effective_top_k
+                )
 
                 # 2. 重排序（如启用）
                 if self.reranking_enabled and retrieved_docs:
@@ -198,36 +225,46 @@ class RAGChain:
             # 3. 构建上下文
             context = self._build_context(retrieved_docs)
 
-            # 4. 生成回答
+            # 4. 构建去重的来源列表
+            seen_sources = set()
+            unique_sources = []
+            for doc in retrieved_docs:
+                src = doc.metadata.get("source", "未知")
+                if src not in seen_sources:
+                    seen_sources.add(src)
+                    unique_sources.append(src)
+
+            # 5. 生成回答
             if self.llm_manager and context:
-                prompt = self._build_prompt(question, context)
-                result = self.llm_manager.generate(prompt)
+                prompt = self._build_prompt(question, context, history)
+                result = self.llm_manager.generate(prompt, provider=provider)
                 answer = result.get("text", "生成失败")
                 metadata = result.get("metadata", {})
-            elif context:
-                answer = f"基于检索到的文档：\n\n{context[:500]}..."
-                metadata = {"provider": "retrieval_only"}
+            elif self.llm_manager:
+                # 无检索结果但有 LLM，直接回答
+                history_context = self._build_history_section(history)
+                if history_context:
+                    prompt = (
+                        f"【对话历史】\n{history_context}\n\n"
+                        f"用户问题：{question}\n\n"
+                        f"知识库中没有找到相关信息，请结合对话历史如实回答。"
+                    )
+                else:
+                    prompt = question
+                result = self.llm_manager.generate(prompt, provider=provider)
+                answer = result.get("text", "生成失败")
+                metadata = result.get("metadata", {})
+                unique_sources = []
             else:
-                answer = "知识库为空，请先添加文档。"
+                answer = "知识库为空且 LLM 未初始化，请先添加文档并配置 LLM。"
                 metadata = {"provider": "none"}
 
             return {
                 "success": True,
                 "question": question,
                 "answer": answer,
-                "sources": [
-                    {
-                        "content": (
-                            doc.page_content[:200] + "..."
-                            if len(doc.page_content) > 200
-                            else doc.page_content
-                        ),
-                        "source": doc.metadata.get("source", "未知"),
-                        "page": doc.metadata.get("page", None),
-                    }
-                    for doc in retrieved_docs
-                ],
-                "num_sources": len(retrieved_docs),
+                "sources": unique_sources,
+                "num_sources": len(unique_sources),
                 "processing_time": time.time() - start_time,
                 "metadata": metadata,
             }
@@ -241,16 +278,20 @@ class RAGChain:
                 "processing_time": time.time() - start_time,
             }
 
-    def _retrieve_documents(self, question: str) -> List[Document]:
+    def _retrieve_documents(
+        self, question: str, k: Optional[int] = None
+    ) -> List[Document]:
         """统一检索入口，按配置选择检索策略。"""
         if not self.vector_store:
             return []
+
+        effective_k = k if k is not None else self.retrieval_top_k
 
         # 父子上下文检索（优先级最高，可与混合搜索叠加）
         if self.parent_child_enabled:
             logger.info("使用父子上下文检索")
             return self.vector_store.parent_child_search(
-                question, k=self.retrieval_top_k
+                question, k=effective_k
             )
 
         # 多查询检索
@@ -258,7 +299,7 @@ class RAGChain:
             logger.info("使用多查询检索（Multi-Query）")
             return self.vector_store.multi_query_search(
                 question,
-                k=self.retrieval_top_k,
+                k=effective_k,
                 llm_manager=self.llm_manager,
             )
 
@@ -267,7 +308,7 @@ class RAGChain:
             logger.info("使用跨语言混合搜索")
             return self.vector_store.cross_lingual_hybrid_search(
                 question,
-                k=self.retrieval_top_k,
+                k=effective_k,
                 dense_weight=self.hybrid_dense_weight,
                 sparse_weight=self.hybrid_sparse_weight,
             )
@@ -277,21 +318,25 @@ class RAGChain:
             logger.info("使用混合搜索（向量 + BM25）")
             return self.vector_store.hybrid_search(
                 question,
-                k=self.retrieval_top_k,
+                k=effective_k,
                 dense_weight=self.hybrid_dense_weight,
                 sparse_weight=self.hybrid_sparse_weight,
             )
 
         # 带阈值的相似度搜索
+        # ChromaDB 默认返回 L2 距离（越小越相似），
+        # score_threshold 配置语义为"最低相似度"，需将距离转为相似度后过滤
         if self.score_threshold > 0:
             docs_with_scores = self.vector_store.similarity_search_with_score(
-                question, k=self.retrieval_top_k
+                question, k=effective_k
             )
-            return [
-                doc
-                for doc, score in docs_with_scores
-                if score <= self.score_threshold
-            ]
+            filtered = []
+            for doc, distance in docs_with_scores:
+                # L2 距离转相似度：similarity = 1 / (1 + distance)
+                similarity = 1.0 / (1.0 + distance)
+                if similarity >= self.score_threshold:
+                    filtered.append(doc)
+            return filtered
 
         # 基础相似度搜索（兜底）
         return self.vector_store.similarity_search(question, k=self.retrieval_top_k)
@@ -299,34 +344,102 @@ class RAGChain:
 
 
     def _build_context(self, documents: List[Document]) -> str:
-        """构建上下文"""
+        """构建上下文，自动裁剪以适配模型 context window。"""
         if not documents:
             return ""
 
+        # 先构建全部文档块
         context_parts = []
         for i, doc in enumerate(documents, 1):
             source = doc.metadata.get("source", "未知来源")
             content = doc.page_content
             context_parts.append(f"【文档 {i}】来源: {source}\n\n{content}\n")
 
-        return "\n---\n".join(context_parts)
+        full_context = "\n---\n".join(context_parts)
+        estimated_tokens = estimate_tokens(full_context)
 
-    def _build_prompt(self, question: str, context: str) -> str:
-        """构建提示词"""
-        return f"""请基于以下参考文档回答用户问题。
+        if estimated_tokens <= self.max_context_tokens:
+            return full_context
 
+        # 超出限制：逐个添加文档直到接近预算
+        logger.warning(
+            f"上下文超限: 估算 {estimated_tokens} tokens > 上限 {self.max_context_tokens}，开始裁剪"
+        )
+        budget = self.max_context_tokens
+        truncated_parts = []
+        for part in context_parts:
+            part_tokens = estimate_tokens(part)
+            if part_tokens > budget:
+                break
+            truncated_parts.append(part)
+            budget -= part_tokens
+
+        if not truncated_parts:
+            logger.warning("上下文裁剪后为空，返回第一个文档截断版")
+            first = context_parts[0]
+            # 截断到预算
+            text_budget = self.max_context_tokens * 3  # 粗略字符数
+            return first[:text_budget] + "\n...(文档过长已截断)"
+
+        dropped = len(context_parts) - len(truncated_parts)
+        logger.info(f"上下文裁剪完成: 保留 {len(truncated_parts)} 个文档，丢弃 {dropped} 个")
+        return "\n---\n".join(truncated_parts)
+
+    @staticmethod
+    def _build_history_section(
+        history: Optional[List[Dict[str, str]]],
+    ) -> str:
+        """构建历史对话文本区段"""
+        if not history:
+            return ""
+        parts = []
+        for msg in history[-6:]:  # 最近6轮
+            role = "用户" if msg.get("role") == "user" else "助手"
+            parts.append(f"{role}：{msg.get('content', '')}")
+        return "\n".join(parts)
+
+    def _build_prompt(
+        self,
+        question: str,
+        context: str,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        """构建提示词（统一入口，含反幻觉约束、引用标注、历史对话）"""
+        history_section = self._build_history_section(history)
+        history_block = f"\n\n【对话历史】\n{history_section}\n" if history_section else ""
+
+        # 反幻觉约束
+        hallucination_warning = """
 【重要约束】
-1. 仔细阅读参考文档中的内容，从文档中提取与问题相关的信息
-2. 如果文档中提到了相关的人名、概念、数据，可以合理推断它们与问题的关系
-3. 如果文档中确实没有相关信息，才说明"无法回答"
-4. 回答时引用你使用的信息来源（如"根据文档提到"、"论文中说明"等）
+1. 只使用参考文档中明确包含的信息，不要捏造、推断或补充文档中没有的概念、术语或数据
+2. 如果文档中没有提到某个概念，直接回答"文档中没有提到"，不要尝试解释或推测
+3. 引用格式：只能引用文档中明确存在的来源（如"根据文档1"、"论文指出"），不要生成虚假引用
+4. 如果问题无法基于文档回答，明确说明"根据提供的文档，无法回答这个问题"
+"""
 
-参考文档：
-{context}
+        # 短事实检测（数值/时间类问题用精简 prompt）
+        question_lower = question.lower()
+        is_short_fact = any(
+            kw in question_lower
+            for kw in ["多久", "多少", "多长时间", "takes", "耗时", "时间", "ms", "秒"]
+        )
 
-用户问题：{question}
+        if is_short_fact:
+            return (
+                f"基于以下参考文档，直接提取并回答用户问题。"
+                f"如果文档中有相关数值，直接给出答案，不需要解释。"
+                f"{hallucination_warning}\n"
+                f"参考文档：\n{context}{history_block}\n"
+                f"用户问题：{question}\n\n请直接回答："
+            )
 
-请用中文回答。"""
+        return (
+            f"基于以下参考文档回答用户问题。"
+            f"{hallucination_warning}"
+            f"{history_block}\n"
+            f"参考文档：\n{context}\n\n"
+            f"用户问题：{question}\n\n请用中文回答。"
+        )
 
     def get_status(self) -> Dict[str, Any]:
         """获取系统状态"""
@@ -393,17 +506,4 @@ class SimpleRAGChain:
         return self.chain.get_status()
 
 
-# 便捷函数
-def create_rag_chain(config: Optional[Dict] = None) -> RAGChain:
-    """创建RAG Chain"""
-    return RAGChain(config)
 
-
-def simple_rag(file_path: str, question: str) -> str:
-    """简单的RAG问答"""
-    with SimpleRAGChain() as chain:
-        # 添加文档
-        chain.add(file_path)
-        # 提问
-        result = chain.ask(question)
-        return result.get("answer", result.get("error", "失败"))
