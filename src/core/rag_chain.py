@@ -76,6 +76,11 @@ class RAGChain:
         # 多查询检索配置
         self.multi_query_enabled = get_config("rag.retriever.multi_query.enabled", False)
 
+        # CRAG（Corrective RAG）配置
+        self.crag_enabled = get_config("rag.corrective.enabled", True)
+        self.crag_threshold = float(get_config("rag.corrective.quality_threshold", 0.3))
+        self.crag_max_retries = int(get_config("rag.corrective.max_retries", 1))
+
         # 初始化状态
         self._initialized = False
 
@@ -187,6 +192,7 @@ class RAGChain:
         history: Optional[List[Dict[str, str]]] = None,
         provider: Optional[str] = None,
         top_k: Optional[int] = None,
+        retrieval_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """查询知识库
 
@@ -195,6 +201,7 @@ class RAGChain:
             history: 对话历史 [{"role": "user/assistant", "content": "..."}]
             provider: LLM 提供者，None 则自动选择
             top_k: 检索文档数量，None 则使用配置默认值
+            retrieval_mode: 检索模式 (hybrid/parent_child/cross_lingual/sparse/dense)，None 用配置默认
         """
         if not self._initialized:
             self.initialize()
@@ -209,8 +216,14 @@ class RAGChain:
             # 1. 检索相关文档
             if self.vector_store:
                 retrieved_docs = self._retrieve_documents(
-                    question, k=effective_top_k
+                    question, k=effective_top_k, mode=retrieval_mode
                 )
+
+                # 2. CRAG: 评估检索质量，质量低时改写查询重试
+                if self.crag_enabled and retrieved_docs:
+                    retrieved_docs = self._corrective_retrieve(
+                        question, retrieved_docs, effective_top_k
+                    )
 
                 # 2. 重排序（如启用）
                 if self.reranking_enabled and retrieved_docs:
@@ -279,13 +292,18 @@ class RAGChain:
             }
 
     def _retrieve_documents(
-        self, question: str, k: Optional[int] = None
+        self, question: str, k: Optional[int] = None,
+        mode: Optional[str] = None,
     ) -> List[Document]:
-        """统一检索入口，按配置选择检索策略。"""
+        """统一检索入口，按配置或指定模式选择检索策略。"""
         if not self.vector_store:
             return []
 
         effective_k = k if k is not None else self.retrieval_top_k
+
+        # 显式指定检索模式时，跳过配置默认策略
+        if mode:
+            return self._dispatch_retrieval(question, effective_k, mode)
 
         # 父子上下文检索（优先级最高，可与混合搜索叠加）
         if self.parent_child_enabled:
@@ -341,6 +359,119 @@ class RAGChain:
         # 基础相似度搜索（兜底）
         return self.vector_store.similarity_search(question, k=self.retrieval_top_k)
 
+    def _dispatch_retrieval(
+        self, question: str, k: int, mode: str
+    ) -> List[Document]:
+        """按显式指定的模式路由到对应检索方法。"""
+        dispatch = {
+            "parent_child": lambda: self.vector_store.parent_child_search(
+                question, k=k
+            ),
+            "cross_lingual": lambda: self.vector_store.cross_lingual_hybrid_search(
+                question,
+                k=k,
+                dense_weight=self.hybrid_dense_weight,
+                sparse_weight=self.hybrid_sparse_weight,
+            ),
+            "hybrid": lambda: self.vector_store.hybrid_search(
+                question,
+                k=k,
+                dense_weight=self.hybrid_dense_weight,
+                sparse_weight=self.hybrid_sparse_weight,
+            ),
+            "dense": lambda: self.vector_store.similarity_search(question, k=k),
+        }
+        handler = dispatch.get(mode)
+        if handler is None:
+            logger.warning(f"未知检索模式 '{mode}'，回退到默认策略")
+            return self._retrieve_documents(question, k=k)
+
+        logger.info(f"使用指定检索模式: {mode}")
+        return handler()
+
+    def _corrective_retrieve(
+        self, question: str, retrieved_docs: List[Document], k: int,
+    ) -> List[Document]:
+        """CRAG: 评估检索质量，质量低时改写查询重试。"""
+        from .vector_store import KeywordCoverageReranker, reciprocal_rank_fusion
+
+        reranker = KeywordCoverageReranker()
+        scores = [reranker.compute_score(question, doc) for doc in retrieved_docs]
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+
+        if avg_score >= self.crag_threshold:
+            logger.info(
+                f"CRAG: 检索质量合格 ({avg_score:.2f} >= {self.crag_threshold})"
+            )
+            return retrieved_docs
+
+        logger.info(
+            f"CRAG: 检索质量低 ({avg_score:.2f} < {self.crag_threshold})，尝试改写查询"
+        )
+
+        # 改写查询
+        rewritten = self._rewrite_query(question)
+        if not rewritten or rewritten == question:
+            logger.info("CRAG: 查询改写未生效，使用原始结果")
+            return retrieved_docs
+
+        # 重新检索（跳过 CRAG 避免无限递归）
+        original_mode = self.crag_enabled
+        self.crag_enabled = False
+        try:
+            new_docs = self._retrieve_documents(rewritten, k=k)
+        finally:
+            self.crag_enabled = original_mode
+
+        if not new_docs:
+            return retrieved_docs
+
+        # RRF 融合原始结果和改写后的结果
+        original_scored = [(doc, s) for doc, s in zip(retrieved_docs, scores)]
+        new_scored = [(doc, 1.0) for doc in new_docs]
+        fused = reciprocal_rank_fusion([original_scored, new_scored])
+        result = [doc for doc, _ in fused[:k]]
+
+        logger.info(
+            f"CRAG: 改写重试完成，'{rewritten[:20]}...' → {len(result)} 个文档"
+        )
+        return result
+
+    def _rewrite_query(self, question: str) -> str:
+        """改写查询: 优先 LLM，fallback 到关键词提取。"""
+        # 尝试 LLM 改写
+        if self.llm_manager is not None:
+            try:
+                prompt = (
+                    f"请用不同方式重新表述以下问题，保持核心含义不变，"
+                    f"直接输出改写后的问题，不要解释。\n\n问题：{question}"
+                )
+                result = self.llm_manager.generate(prompt)
+                rewritten = result.get("text", "").strip()
+                if rewritten and rewritten != question and len(rewritten) > 2:
+                    logger.info(f"CRAG: LLM 改写 '{question[:20]}' → '{rewritten[:20]}'")
+                    return rewritten
+            except Exception as e:
+                logger.warning(f"CRAG: LLM 改写失败: {e}")
+
+        # 规则 fallback: 提取关键词重新组合
+        return self._keyword_rewrite(question)
+
+    @staticmethod
+    def _keyword_rewrite(question: str) -> str:
+        """规则改写: 提取关键词，去掉常见提问词后重组。"""
+        import re
+
+        # 移除常见提问前缀
+        q = re.sub(
+            r"^(请|帮我|如何|怎么|怎样|什么是|什么是叫|什么叫|什么|哪个|为什么|能否|可以|请帮我|你能|告诉我)",
+            "", question,
+        )
+        q = re.sub(r"[？?！!。.]+$", "", q).strip()
+        # 如果处理结果太短（可能是全被去掉了），返回原文
+        if len(q) < 3:
+            return question
+        return q
 
 
     def _build_context(self, documents: List[Document]) -> str:

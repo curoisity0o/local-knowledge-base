@@ -141,6 +141,7 @@ class TestRAGChainQuery:
         mock_llm.return_value = mock_llm_instance
 
         chain = RAGChain()
+        chain.crag_enabled = False  # 空知识库不需要 CRAG
         chain.initialize()
 
         result = chain.query("什么是AI？")
@@ -178,6 +179,147 @@ class TestRAGChainQuery:
         assert "processing_time" in result
         assert isinstance(result["processing_time"], float)
         assert result["processing_time"] >= 0
+
+
+class TestCRAG:
+    """CRAG（Corrective RAG）测试"""
+
+    def test_keyword_rewrite_removes_prefix(self):
+        """测试规则改写: 移除提问前缀"""
+        assert RAGChain._keyword_rewrite("什么是机器学习") == "机器学习"
+        assert RAGChain._keyword_rewrite("如何使用这个功能") == "使用这个功能"
+        assert RAGChain._keyword_rewrite("AI") == "AI"  # 太短，返回原文
+
+    def test_keyword_rewrite_strips_punctuation(self):
+        """测试规则改写: 去除末尾标点"""
+        result = RAGChain._keyword_rewrite("机器学习是什么？")
+        assert result == "机器学习是什么"
+        assert "？" not in result
+
+    def test_corrective_retrieve_passes_when_quality_good(self):
+        """测试 CRAG: 检索质量合格时直接返回"""
+        chain = RAGChain()
+        chain.crag_threshold = 0.3
+        chain.crag_enabled = True
+        chain.llm_manager = None
+
+        docs = [
+            Document(page_content="机器学习是人工智能的分支", metadata={"source": "a"}),
+            Document(page_content="深度学习使用神经网络", metadata={"source": "b"}),
+        ]
+
+        result = chain._corrective_retrieve("机器学习", docs, k=4)
+        # 两个文档都包含查询关键词，覆盖率应该高于阈值
+        assert result == docs  # 质量合格，返回原文
+
+    def test_corrective_retrieve_disabled(self):
+        """测试 CRAG 禁用时直接返回"""
+        chain = RAGChain()
+        chain.crag_enabled = False
+
+        docs = [Document(page_content="无关内容", metadata={"source": "a"})]
+        result = chain._corrective_retrieve("机器学习", docs, k=4)
+        assert result == docs
+
+    def test_corrective_retrieve_empty_docs(self):
+        """测试 CRAG: 空文档列表"""
+        chain = RAGChain()
+        chain.crag_enabled = True
+        result = chain._corrective_retrieve("问题", [], k=4)
+        assert result == []
+
+    def test_corrective_retrieve_triggers_rewrite(self):
+        """测试 CRAG: 质量低时触发改写重试"""
+        chain = RAGChain()
+        chain.crag_threshold = 0.8  # 高阈值，几乎不可能达到
+        chain.crag_enabled = True
+        chain.llm_manager = MagicMock()
+        chain.llm_manager.generate.return_value = {"text": "改写后的问题"}
+
+        # 模拟 _retrieve_documents 返回更好的结果
+        chain._retrieve_documents = MagicMock(return_value=[
+            Document(page_content="包含改写关键词的文档", metadata={"source": "c"}),
+        ])
+
+        docs = [Document(page_content="完全不相关的内容", metadata={"source": "a"})]
+        result = chain._corrective_retrieve("模糊问题", docs, k=4)
+
+        # 应该触发了改写和重试
+        chain.llm_manager.generate.assert_called_once()
+        chain._retrieve_documents.assert_called_once()
+        # 结果应该包含原始和重试的文档
+        assert len(result) >= 1
+
+
+class TestRetrievalMode:
+    """检索模式选择测试"""
+
+    @patch("src.core.rag_chain.LLMManager")
+    @patch("src.core.rag_chain.SimpleVectorStore")
+    @patch("src.core.rag_chain.DocumentProcessor")
+    def test_dispatch_hybrid_mode(self, mock_doc_proc, mock_vs, mock_llm):
+        """测试指定 hybrid 模式"""
+        mock_vs_instance = MagicMock()
+        mock_vs_instance.hybrid_search.return_value = [
+            Document(page_content="结果1", metadata={"source": "a"}),
+        ]
+        mock_vs.return_value = mock_vs_instance
+
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate.return_value = {"text": "答案", "metadata": {}}
+        mock_llm.return_value = mock_llm_instance
+
+        chain = RAGChain()
+        chain.initialize()
+        chain.crag_enabled = False
+
+        chain.query("测试", retrieval_mode="hybrid")
+
+        mock_vs_instance.hybrid_search.assert_called_once()
+
+    @patch("src.core.rag_chain.LLMManager")
+    @patch("src.core.rag_chain.SimpleVectorStore")
+    @patch("src.core.rag_chain.DocumentProcessor")
+    def test_dispatch_dense_mode(self, mock_doc_proc, mock_vs, mock_llm):
+        """测试指定 dense 模式"""
+        mock_vs_instance = MagicMock()
+        mock_vs_instance.similarity_search.return_value = [
+            Document(page_content="结果1", metadata={"source": "a"}),
+        ]
+        mock_vs.return_value = mock_vs_instance
+
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate.return_value = {"text": "答案", "metadata": {}}
+        mock_llm.return_value = mock_llm_instance
+
+        chain = RAGChain()
+        chain.initialize()
+        chain.crag_enabled = False
+
+        chain.query("测试", retrieval_mode="dense")
+
+        mock_vs_instance.similarity_search.assert_called_once()
+
+    @patch("src.core.rag_chain.LLMManager")
+    @patch("src.core.rag_chain.SimpleVectorStore")
+    @patch("src.core.rag_chain.DocumentProcessor")
+    def test_dispatch_unknown_mode_fallback(self, mock_doc_proc, mock_vs, mock_llm):
+        """测试未知模式回退到默认"""
+        mock_vs_instance = MagicMock()
+        mock_vs_instance.similarity_search.return_value = []
+        mock_vs.return_value = mock_vs_instance
+
+        mock_llm_instance = MagicMock()
+        mock_llm_instance.generate.return_value = {"text": "答案", "metadata": {}}
+        mock_llm.return_value = mock_llm_instance
+
+        chain = RAGChain()
+        chain.initialize()
+        chain.crag_enabled = False
+
+        # 未知模式应回退到默认（不报错）
+        result = chain.query("测试", retrieval_mode="nonexistent")
+        assert result["success"] is True
 
 
 class TestSimpleRAGChain:

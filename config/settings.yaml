@@ -30,8 +30,15 @@ document_processing:
     max_chunks_per_doc: "${MAX_CHUNKS_PER_DOC:-100}"
     # 父子分块配置（父块提供完整上下文，子块用于精准检索）
     use_parent_child: true          # 设为 true 以启用父子分块模式
+    use_semantic: false             # 启用语义分块（优先级高于 use_parent_child）
     parent_chunk_size: 1500          # 父块大小（字符数）
     child_chunk_size: 400            # 子块大小（字符数）
+
+    # 语义分块配置
+    semantic:
+      breakpoint_threshold: 0.3      # embedding 相似度断点阈值（越低切分越少）
+      min_chunk_size: 200            # 最小 chunk 字符数
+      max_chunk_size: 1000           # 最大 chunk 字符数
     
   text_splitter:
     type: "recursive_character"
@@ -146,6 +153,13 @@ rag:
   cross_lingual:
     enabled: true  # 启用跨语言搜索（中文查询英文文档）
     translation_enabled: true  # 启用Query翻译
+    cache_size: 100  # QueryTranslator LRU 缓存条数
+
+  # CRAG（Corrective RAG）配置
+  corrective:
+    enabled: true             # 启用检索质量自评估+失败重试
+    quality_threshold: 0.3    # 关键词覆盖率阈值（低于此值触发改写重试）
+    max_retries: 1            # 最大改写重试次数
     
   generation:
     prompt_template: |

@@ -109,6 +109,10 @@ class QueryRequest(BaseModel):
     history: Optional[List[Dict[str, str]]] = Field(
         default_factory=list, description="对话历史 [{'role': 'user/assistant', 'content': '...'}]"
     )
+    retrieval_mode: Optional[str] = Field(
+        default=None,
+        description="检索模式: hybrid/parent_child/cross_lingual/sparse/dense，None 用配置默认",
+    )
 
     @field_validator("question")
     @classmethod
@@ -428,6 +432,7 @@ async def query_knowledge_base(request: QueryRequest):
                 history=request.history or [],
                 provider=request.provider,
                 top_k=request.top_k,
+                retrieval_mode=request.retrieval_mode,
             )
 
             answer = rag_result.get("answer", "生成失败")

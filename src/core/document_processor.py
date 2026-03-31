@@ -125,6 +125,139 @@ class MarkdownAwareSplitter:
         return final_chunks
 
 
+class SemanticChunker:
+    """语义分块器：基于 embedding 相似度断点切分文本。
+
+    对每个句子计算 embedding，相邻句子的余弦相似度低于阈值时切分。
+    比固定字符切分更能保持语义完整性。
+    """
+
+    def __init__(
+        self,
+        embedder=None,
+        breakpoint_threshold: float = 0.3,
+        min_chunk_size: int = 200,
+        max_chunk_size: int = 1000,
+    ):
+        self._embedder = embedder
+        self._threshold = breakpoint_threshold
+        self._min_size = min_chunk_size
+        self._max_size = max_chunk_size
+
+    def _ensure_embedder(self):
+        """延迟初始化 embedder"""
+        if self._embedder is None:
+            try:
+                from langchain_ollama import OllamaEmbeddings
+            except ImportError:
+                from langchain_community.embeddings import OllamaEmbeddings
+
+            ollama_model = get_config("embeddings.ollama_model", "bge-m3")
+            self._embedder = OllamaEmbeddings(
+                model=ollama_model, base_url="http://localhost:11434"
+            )
+            logger.info(f"语义分块: 初始化 embedder ({ollama_model})")
+
+    @staticmethod
+    def _split_sentences(text: str) -> List[str]:
+        """按句子边界分割（中英文标点）"""
+        # 按句末标点分割，保留标点到前面的句子
+        parts = re.split(r"(?<=[。！？.!?])\s*", text)
+        return [p.strip() for p in parts if len(p.strip()) > 2]
+
+    def _compute_similarities(self, sentences: List[str]) -> List[float]:
+        """计算相邻句子的 embedding 余弦相似度"""
+        self._ensure_embedder()
+        embeddings = self._embedder.embed_documents(sentences)
+
+        similarities = []
+        for i in range(len(embeddings) - 1):
+            a, b = embeddings[i], embeddings[i + 1]
+            # 余弦相似度
+            dot = sum(x * y for x, y in zip(a, b))
+            norm_a = sum(x * x for x in a) ** 0.5
+            norm_b = sum(x * x for x in b) ** 0.5
+            sim = dot / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
+            similarities.append(sim)
+
+        return similarities
+
+    def _normalize_chunks(self, chunks: List[str]) -> List[str]:
+        """后处理: 合并过短的 chunk，拆分过长的 chunk"""
+        if not chunks:
+            return []
+
+        # 合并过短的 chunk 到下一个
+        merged = []
+        buffer = chunks[0]
+        for chunk in chunks[1:]:
+            if len(buffer) < self._min_size:
+                buffer = buffer + chunk
+            else:
+                merged.append(buffer)
+                buffer = chunk
+        merged.append(buffer)
+
+        # 拆分过长的 chunk
+        result = []
+        for chunk in merged:
+            if len(chunk) > self._max_size:
+                # 在最后一个句号处拆分
+                sentences = self._split_sentences(chunk)
+                sub = ""
+                for s in sentences:
+                    if len(sub) + len(s) > self._max_size and sub:
+                        result.append(sub)
+                        sub = s
+                    else:
+                        sub += s
+                if sub:
+                    result.append(sub)
+            else:
+                result.append(chunk)
+
+        return result
+
+    def split_text(self, text: str) -> List[str]:
+        """对单段文本做语义分块"""
+        sentences = self._split_sentences(text)
+        if len(sentences) <= 1:
+            return [text] if text.strip() else []
+
+        similarities = self._compute_similarities(sentences)
+
+        # 找断点: 相似度低于阈值的位置
+        breakpoints = [
+            i + 1 for i, s in enumerate(similarities) if s < self._threshold
+        ]
+
+        # 合并断点间的句子为 chunk
+        chunks = []
+        start = 0
+        for bp in breakpoints:
+            chunk_text = "".join(sentences[start:bp])
+            chunks.append(chunk_text)
+            start = bp
+        if start < len(sentences):
+            chunks.append("".join(sentences[start:]))
+
+        return self._normalize_chunks(chunks)
+
+    def split_documents(self, documents: List[Document]) -> List[Document]:
+        """对文档列表做语义分块，保留 metadata"""
+        all_chunks = []
+        for doc in documents:
+            chunks = self.split_text(doc.page_content)
+            for chunk_text in chunks:
+                all_chunks.append(
+                    Document(page_content=chunk_text, metadata=dict(doc.metadata))
+                )
+        logger.info(
+            "语义分块完成: %d 个文档 -> %d 个 chunks", len(documents), len(all_chunks)
+        )
+        return all_chunks
+
+
 class ParentChildSplitter:
     """父子分块器：将文档分为大粒度父块和小粒度子块。
 
@@ -249,6 +382,19 @@ class DocumentProcessor:
         # 是否启用父子分块模式
         self.use_parent_child = bool(
             get_config("document_processing.chunking.use_parent_child", False)
+        )
+
+        # 是否启用语义分块（优先级高于父子分块）
+        self.use_semantic_chunking = bool(
+            get_config("document_processing.chunking.use_semantic", False)
+        )
+
+        # 语义分块配置
+        semantic_config = get_config("document_processing.chunking.semantic", {})
+        self.semantic_chunker = SemanticChunker(
+            breakpoint_threshold=float(semantic_config.get("breakpoint_threshold", 0.3)),
+            min_chunk_size=int(semantic_config.get("min_chunk_size", 200)),
+            max_chunk_size=int(semantic_config.get("max_chunk_size", 1000)),
         )
 
         # 获取配置
@@ -614,7 +760,10 @@ JSON格式："""
                 doc.page_content = self.preprocess_text(doc.page_content, file_format)
 
         # 3. 分割文档
-        if self.use_parent_child:
+        if self.use_semantic_chunking:
+            logger.info(f"使用语义分块器: {file_path}")
+            chunks = self.semantic_chunker.split_documents(documents)
+        elif self.use_parent_child:
             # 父子分块模式：子块用于检索，父块内容存入 metadata 以提供更完整上下文
             logger.info(f"使用父子分块器: {file_path}")
             chunks = self.parent_child_splitter.split_documents(documents)
