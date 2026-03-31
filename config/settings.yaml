@@ -160,6 +160,11 @@ rag:
     enabled: true             # 启用检索质量自评估+失败重试
     quality_threshold: 0.3    # 关键词覆盖率阈值（低于此值触发改写重试）
     max_retries: 1            # 最大改写重试次数
+
+  # 答案溯源验证
+  citation_verification:
+    enabled: true             # 启用引用编号校验（检查[文档N]是否真实存在）
+    warn_on_invalid: true     # 对无效引用在答案末尾追加警告
     
   generation:
     prompt_template: |
@@ -369,3 +374,11 @@ hardware:
     enable_flash_attention: true
     enable_tensor_parallel: false
     enable_paged_attention: true
+
+# Agent 配置
+agent:
+  enabled: true
+  classifier:
+    fallback: "simple"         # 分类失败时的默认行为
+  graph:
+    max_iterations: 3          # 反思循环最大迭代次数

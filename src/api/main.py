@@ -113,6 +113,10 @@ class QueryRequest(BaseModel):
         default=None,
         description="检索模式: hybrid/parent_child/cross_lingual/sparse/dense，None 用配置默认",
     )
+    use_agent: bool = Field(
+        default=False,
+        description="启用 Agent 模式：复杂问题自动走 LangGraph Agent，简单问题走 RAGChain",
+    )
 
     @field_validator("question")
     @classmethod
@@ -125,7 +129,7 @@ class QueryRequest(BaseModel):
 
 class QueryResponse(BaseModel):
     answer: str
-    sources: List[str] = []
+    sources: List[Dict[str, Any]] = []
     provider: str
     response_time: float
     tokens_used: Optional[dict] = None
@@ -422,24 +426,62 @@ async def query_knowledge_base(request: QueryRequest):
 
     try:
         if request.use_rag:
-            # RAG 模式：通过 RAGChain 走完整检索管线
-            # （hybrid search / parent-child / reranking 等按配置生效）
-            from src.core.rag_chain import RAGChain
+            if request.use_agent:
+                # Agent 模式：分类路由，复杂问题走 LangGraph Agent
+                from src.agents.classifier import QueryClassifier, SIMPLE, COMPLEX
+                from src.agents.graph_agent import GraphAgent
+                from src.core.rag_chain import RAGChain
 
-            rag_chain = get_rag_chain()
-            rag_result = rag_chain.query(
-                question=request.question,
-                history=request.history or [],
-                provider=request.provider,
-                top_k=request.top_k,
-                retrieval_mode=request.retrieval_mode,
-            )
+                llm_manager = get_llm_manager()
+                vector_store = get_vector_store()
 
-            answer = rag_result.get("answer", "生成失败")
-            sources = rag_result.get("sources", [])
-            metadata = rag_result.get("metadata", {})
-            provider_used = metadata.get("provider", "unknown")
-            tokens = rag_result.get("tokens")
+                # 分类
+                classifier = QueryClassifier(llm_manager)
+                complexity = classifier.classify(request.question)
+
+                if complexity == COMPLEX:
+                    # 复杂问题走 GraphAgent
+                    logger.info("Agent 路由: complex → GraphAgent")
+                    agent = GraphAgent(llm_manager=llm_manager, vector_store=vector_store)
+                    agent_result = agent.process(request.question)
+                    answer = agent_result.get("answer", "生成失败")
+                    sources = []
+                    provider_used = "agent"
+                    tokens = None
+                else:
+                    # 简单问题走 RAGChain
+                    logger.info("Agent 路由: simple → RAGChain")
+                    rag_chain = get_rag_chain()
+                    rag_result = rag_chain.query(
+                        question=request.question,
+                        history=request.history or [],
+                        provider=request.provider,
+                        top_k=request.top_k,
+                        retrieval_mode=request.retrieval_mode,
+                    )
+                    answer = rag_result.get("answer", "生成失败")
+                    sources = rag_result.get("sources", [])
+                    metadata = rag_result.get("metadata", {})
+                    provider_used = metadata.get("provider", "unknown")
+                    tokens = rag_result.get("tokens")
+            else:
+                # RAG 模式：通过 RAGChain 走完整检索管线
+                from src.core.rag_chain import RAGChain
+
+                rag_chain = get_rag_chain()
+                rag_result = rag_chain.query(
+                    question=request.question,
+                    history=request.history or [],
+                    provider=request.provider,
+                    top_k=request.top_k,
+                    retrieval_mode=request.retrieval_mode,
+                )
+
+                answer = rag_result.get("answer", "生成失败")
+                sources = rag_result.get("sources", [])
+                metadata = rag_result.get("metadata", {})
+                provider_used = metadata.get("provider", "unknown")
+                tokens = rag_result.get("tokens")
         else:
             # 直接生成模式（不检索）
             llm_manager = get_llm_manager()

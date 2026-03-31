@@ -16,6 +16,21 @@ from .config import get_config
 
 logger = logging.getLogger(__name__)
 
+# 中英文停用词集合，供 BM25 分词和关键词提取共用
+BM25_STOPWORDS: frozenset = frozenset({
+    # 中文停用词
+    "的", "了", "是", "在", "有", "和", "与", "或", "不", "也",
+    "都", "就", "要", "会", "能", "可以", "什么", "怎么", "如何",
+    "为什么", "哪", "哪些", "这个", "那个", "一个", "没", "被",
+    "把", "让", "给", "到", "从", "对", "而", "但", "却",
+    # 英文停用词
+    "the", "a", "an", "is", "are", "was", "were", "be", "been",
+    "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "could", "should", "may", "might", "can", "to", "of",
+    "in", "for", "on", "with", "at", "by", "from", "as", "into",
+    "about", "how", "what", "which", "who", "when", "where", "why",
+})
+
 
 class LanguageDetector:
     """语言检测器"""
@@ -214,7 +229,11 @@ class BM25:
             tokens = text_lower.split()
 
         # 过滤停用词、单字符空白、纯数字
-        return [t for t in tokens if len(t) > 1 and not t.isspace() and not t.isdigit()]
+        return [
+            t for t in tokens
+            if len(t) > 1 and not t.isspace() and not t.isdigit()
+            and t not in BM25_STOPWORDS
+        ]
 
     def _calculate_idf(self):
         """计算IDF"""
@@ -346,17 +365,7 @@ class KeywordCoverageReranker:
         else:
             tokens = text_lower.split()
         # 过滤停用词和单字符
-        stopwords = {
-            "的", "了", "是", "在", "有", "和", "与", "或", "不", "也",
-            "都", "就", "要", "会", "能", "可以", "什么", "怎么", "如何",
-            "为什么", "哪", "哪些", "这个", "那个", "一个", "the", "a",
-            "an", "is", "are", "was", "were", "be", "been", "being", "have",
-            "has", "had", "do", "does", "did", "will", "would", "could",
-            "should", "may", "might", "can", "to", "of", "in", "for", "on",
-            "with", "at", "by", "from", "as", "into", "about", "how",
-            "what", "which", "who", "when", "where", "why",
-        }
-        return [t for t in tokens if len(t) > 1 and t not in stopwords]
+        return [t for t in tokens if len(t) > 1 and t not in BM25_STOPWORDS]
 
     @staticmethod
     def compute_score(query: str, document: Document) -> float:

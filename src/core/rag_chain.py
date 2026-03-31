@@ -6,7 +6,7 @@ RAG Chain 模块
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
 
@@ -80,6 +80,14 @@ class RAGChain:
         self.crag_enabled = get_config("rag.corrective.enabled", True)
         self.crag_threshold = float(get_config("rag.corrective.quality_threshold", 0.3))
         self.crag_max_retries = int(get_config("rag.corrective.max_retries", 1))
+
+        # 答案溯源验证配置
+        self.citation_verify_enabled = get_config(
+            "rag.citation_verification.enabled", True
+        )
+        self.citation_warn_on_invalid = get_config(
+            "rag.citation_verification.warn_on_invalid", True
+        )
 
         # 初始化状态
         self._initialized = False
@@ -235,24 +243,47 @@ class RAGChain:
             else:
                 retrieved_docs = []
 
-            # 3. 构建上下文
-            context = self._build_context(retrieved_docs)
+            # 3. 计算相关性分数，用于排序、sources 和上下文截断
+            doc_scores: Dict[str, float] = {}
+            if retrieved_docs and question:
+                from .vector_store import KeywordCoverageReranker
+                reranker = KeywordCoverageReranker()
+                for doc in retrieved_docs:
+                    # 用 page_content 作为 key 去重
+                    key = doc.page_content
+                    if key not in doc_scores:
+                        doc_scores[key] = reranker.compute_score(question, doc)
 
-            # 4. 构建去重的来源列表
+            # 4. 构建上下文（按分数排序）
+            context = self._build_context(retrieved_docs, doc_scores)
+
+            # 5. 构建去重的来源列表（附带分数）
             seen_sources = set()
             unique_sources = []
             for doc in retrieved_docs:
                 src = doc.metadata.get("source", "未知")
                 if src not in seen_sources:
                     seen_sources.add(src)
-                    unique_sources.append(src)
+                    score = doc_scores.get(doc.page_content, 0.0)
+                    unique_sources.append({"source": src, "score": round(score, 3)})
 
-            # 5. 生成回答
+            # 6. 生成回答
             if self.llm_manager and context:
                 prompt = self._build_prompt(question, context, history)
                 result = self.llm_manager.generate(prompt, provider=provider)
                 answer = result.get("text", "生成失败")
                 metadata = result.get("metadata", {})
+
+                # 7. 答案溯源验证
+                citation_report = []
+                if self.citation_verify_enabled:
+                    # _build_context 按分数排序后可能截断，取实际传入的文档数
+                    num_docs = len(retrieved_docs)
+                    answer, citation_report = self._verify_citations(
+                        answer, num_docs
+                    )
+                else:
+                    citation_report = []
             elif self.llm_manager:
                 # 无检索结果但有 LLM，直接回答
                 history_context = self._build_history_section(history)
@@ -268,9 +299,11 @@ class RAGChain:
                 answer = result.get("text", "生成失败")
                 metadata = result.get("metadata", {})
                 unique_sources = []
+                citation_report = []
             else:
                 answer = "知识库为空且 LLM 未初始化，请先添加文档并配置 LLM。"
                 metadata = {"provider": "none"}
+                citation_report = []
 
             return {
                 "success": True,
@@ -280,6 +313,7 @@ class RAGChain:
                 "num_sources": len(unique_sources),
                 "processing_time": time.time() - start_time,
                 "metadata": metadata,
+                "citation_report": citation_report,
             }
 
         except Exception as e:
@@ -428,7 +462,8 @@ class RAGChain:
 
         # RRF 融合原始结果和改写后的结果
         original_scored = [(doc, s) for doc, s in zip(retrieved_docs, scores)]
-        new_scored = [(doc, 1.0) for doc in new_docs]
+        new_scores = [reranker.compute_score(question, doc) for doc in new_docs]
+        new_scored = [(doc, s) for doc, s in zip(new_docs, new_scores)]
         fused = reciprocal_rank_fusion([original_scored, new_scored])
         result = [doc for doc, _ in fused[:k]]
 
@@ -474,10 +509,25 @@ class RAGChain:
         return q
 
 
-    def _build_context(self, documents: List[Document]) -> str:
-        """构建上下文，自动裁剪以适配模型 context window。"""
+    def _build_context(
+        self, documents: List[Document], doc_scores: Optional[Dict[str, float]] = None,
+    ) -> str:
+        """构建上下文，自动裁剪以适配模型 context window。
+
+        Args:
+            documents: 检索到的文档列表
+            doc_scores: 文档相关性分数映射（page_content -> score），用于按分数排序截断
+        """
         if not documents:
             return ""
+
+        # 按相关性分数排序，确保裁剪时丢弃低分文档
+        if doc_scores and len(documents) > 1:
+            documents = sorted(
+                documents,
+                key=lambda d: doc_scores.get(d.page_content, 0.0),
+                reverse=True,
+            )
 
         # 先构建全部文档块
         context_parts = []
@@ -571,6 +621,62 @@ class RAGChain:
             f"参考文档：\n{context}\n\n"
             f"用户问题：{question}\n\n请用中文回答。"
         )
+
+    def _verify_citations(
+        self, answer: str, num_docs: int,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """校验答案中的文档引用编号是否真实存在。
+
+        Args:
+            answer: LLM 生成的回答文本
+            num_docs: 上下文中实际提供的文档数量
+
+        Returns:
+            (可能追加警告的回答, 溯源报告列表)
+        """
+        import re
+
+        report = []
+
+        # 匹配 [文档N]、[文档 N]、[N]、文档N、文档 N 等引用格式
+        patterns = [
+            r"\[文档\s*(\d+)\]",
+            r"文档\s*(\d+)",
+            r"\[(\d+)\]",
+        ]
+        cited_nums: set = set()
+        for pattern in patterns:
+            for match in re.finditer(pattern, answer):
+                cited_nums.add(int(match.group(1)))
+
+        if not cited_nums:
+            return answer, report
+
+        valid_nums = set(range(1, num_docs + 1))
+        invalid = cited_nums - valid_nums
+
+        for n in sorted(cited_nums):
+            report.append({
+                "ref": n,
+                "valid": n in valid_nums,
+            })
+
+        if not invalid:
+            logger.info(f"溯源验证通过: 引用了 {len(cited_nums)} 个文档，全部有效")
+            return answer, report
+
+        logger.warning(
+            f"溯源验证发现无效引用: {invalid} (上下文仅有 {num_docs} 个文档)"
+        )
+
+        if self.citation_warn_on_invalid:
+            invalid_str = ", ".join(f"[文档{n}]" for n in sorted(invalid))
+            answer += (
+                f"\n\n---\n⚠️ **溯源警告**: 以上回答中引用了 {invalid_str}，"
+                f"但提供的参考文档中不存在这些编号，请谨慎采信相关内容。"
+            )
+
+        return answer, report
 
     def get_status(self) -> Dict[str, Any]:
         """获取系统状态"""

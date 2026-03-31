@@ -322,6 +322,93 @@ class TestRetrievalMode:
         assert result["success"] is True
 
 
+class TestCitationVerification:
+    """答案溯源验证测试"""
+
+    def test_valid_citations_pass(self):
+        """测试有效引用：全部编号在范围内"""
+        chain = RAGChain()
+        chain.citation_warn_on_invalid = True
+
+        answer = "根据文档1和文档2，机器学习是AI的分支。"
+        result_answer, report = chain._verify_citations(answer, num_docs=3)
+
+        # 有效引用不修改答案
+        assert result_answer == answer
+        assert all(item["valid"] for item in report)
+        assert len(report) == 2
+
+    def test_invalid_citation_warns(self):
+        """测试无效引用：超出范围的编号追加警告"""
+        chain = RAGChain()
+        chain.citation_warn_on_invalid = True
+
+        answer = "根据文档1和文档5的信息，系统运行正常。"
+        result_answer, report = chain._verify_citations(answer, num_docs=3)
+
+        # 无效引用 [文档5] 应触发警告
+        assert "⚠️" in result_answer
+        assert "文档5" in result_answer
+        assert any(not item["valid"] for item in report)
+
+    def test_invalid_citation_no_warn_when_disabled(self):
+        """测试禁用警告时不追加内容"""
+        chain = RAGChain()
+        chain.citation_warn_on_invalid = False
+
+        answer = "根据文档1和文档5的信息，系统运行正常。"
+        result_answer, report = chain._verify_citations(answer, num_docs=3)
+
+        # 答案不被修改，但报告仍然记录
+        assert result_answer == answer
+        assert any(not item["valid"] for item in report)
+
+    def test_no_citations_returns_empty_report(self):
+        """测试答案无引用时返回空报告"""
+        chain = RAGChain()
+
+        answer = "机器学习是人工智能的一个重要分支。"
+        result_answer, report = chain._verify_citations(answer, num_docs=3)
+
+        assert result_answer == answer
+        assert report == []
+
+    def test_bracket_only_format(self):
+        """测试纯数字引用格式 [1] [2]"""
+        chain = RAGChain()
+        chain.citation_warn_on_invalid = True
+
+        answer = "根据[1]和[3]的研究结果，该方法是有效的。"
+        result_answer, report = chain._verify_citations(answer, num_docs=2)
+
+        # [3] 超出范围（仅有 1,2）
+        assert "⚠️" in result_answer
+        assert len(report) == 2  # [1] 和 [3]
+
+    def test_mixed_citation_formats(self):
+        """测试混合引用格式：[文档1]、文档2、[3]"""
+        chain = RAGChain()
+        chain.citation_warn_on_invalid = False
+
+        answer = "如文档1所述，结合[文档2]和[3]的分析。"
+        result_answer, report = chain._verify_citations(answer, num_docs=3)
+
+        # 全部有效（1,2,3）
+        assert all(item["valid"] for item in report)
+        assert len(report) == 3
+
+    def test_zero_docs_all_invalid(self):
+        """测试上下文为0个文档时所有引用都无效"""
+        chain = RAGChain()
+        chain.citation_warn_on_invalid = True
+
+        answer = "根据文档1的信息。"
+        result_answer, report = chain._verify_citations(answer, num_docs=0)
+
+        assert "⚠️" in result_answer
+        assert all(not item["valid"] for item in report)
+
+
 class TestSimpleRAGChain:
     """SimpleRAGChain 上下文管理器测试"""
 

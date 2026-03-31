@@ -110,14 +110,16 @@ local-knowledge-base/
 │   └── vector_store/     # 向量数据库存储
 ├── src/                   # 源代码
 │   ├── core/             # 核心模块
-│   │   ├── document_processor.py
-│   │   ├── vector_store.py
-│   │   ├── rag_chain.py
-│   │   └── llm_manager.py  # 双模式LLM管理
-│   ├── agents/           # Agent系统
-│   │   ├── base_agent.py
-│   │   ├── rag_agent.py
-│   │   └── tools.py
+│   │   ├── document_processor.py  # 文档处理 + 语义分块
+│   │   ├── vector_store.py       # 向量库 + BM25 + RRF + Reranker
+│   │   ├── rag_chain.py          # RAG 检索链 + CRAG + 溯源验证
+│   │   └── llm_manager.py        # 双模式LLM管理
+│   ├── agents/           # Agent系统 (LangGraph)
+│   │   ├── classifier.py         # 查询复杂度分类器
+│   │   ├── graph_agent.py        # LangGraph Agentic RAG
+│   │   ├── base_agent.py         # 传统 Agent 基类
+│   │   ├── rag_agent.py          # 传统 RAG Agent
+│   │   └── tools.py              # 工具集 (11 个 Skill)
 │   ├── api/              # API服务
 │   │   ├── main.py
 │   │   ├── routes.py

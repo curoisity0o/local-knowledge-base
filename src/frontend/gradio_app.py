@@ -99,8 +99,11 @@ def query_knowledge_base(
             source_lines = []
             for i, s in enumerate(sources, 1):
                 src_name = Path(s.get("source", "未知")).name
-                content_preview = s.get("content", "")[:120].replace("\n", " ")
-                source_lines.append(f"**[{i}] {src_name}**\n> {content_preview}…")
+                score = s.get("score")
+                content_preview = s.get("content", "")
+                score_text = f" (相关度: {score})" if score else ""
+                content_text = f"\n> {content_preview[:120].replace(chr(10), ' ')}…" if content_preview else ""
+                source_lines.append(f"**[{i}] {src_name}**{score_text}{content_text}")
             sources_text = "\n\n".join(source_lines)
         else:
             sources_text = "_未找到相关参考文档_"

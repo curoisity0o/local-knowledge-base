@@ -59,7 +59,9 @@ data/               # raw_docs, processed, vector_store (gitignored)
 tests/              # Mirrors src/ structure
 ```
 
-**Data flow**: Raw documents → DocumentProcessor (chunking with parent-child support) → VectorStore (ChromaDB) → RAG retrieval (hybrid: dense + BM25 sparse with RRF fusion) → LLM generation.
+**Data flow**: Raw documents → DocumentProcessor (chunking with parent-child or semantic support) → VectorStore (ChromaDB) → RAG retrieval (hybrid: dense + BM25 sparse with RRF fusion, CRAG self-correction) → Citation verification → LLM generation.
+
+**Agent mode** (`src/agents/`): QueryClassifier routes queries — `simple` → RAGChain, `complex` → GraphAgent (LangGraph StateGraph with analyze→execute→reflect→synthesize loop). Enabled via `use_agent=true` in `/api/v1/query`.
 
 **Dual-mode LLM** (`src/core/llm_manager.py`): `local` mode uses Ollama (DeepSeek-V2-Lite/Qwen2.5-7B), `api` mode uses cloud providers. Configurable via `settings.yaml` under `llm.default_mode` (auto/local_only/api_only/local_first).
 
@@ -85,7 +87,10 @@ def get_vector_store():
 - **Chunking**: Parent-child mode enabled by default (parent 1500 chars, child 400 chars)
 - **Cross-lingual search**: Enabled — Chinese queries auto-translated for English doc retrieval
 - **Reranking**: Disabled by default (requires BAAI/bge-reranker-large)
-- **Agent tools**: hybrid_search, parent_context_search, decompose_query, knowledge_summary, etc.
+- **CRAG**: Enabled — retrieval self-correction with query rewrite on low quality
+- **Citation verification**: Enabled — validates [文档N] references, warns on invalid
+- **Agent mode**: `use_agent=true` in /api/v1/query — QueryClassifier routes simple→RAGChain, complex→GraphAgent (LangGraph)
+- **Agent tools**: hybrid_search, parent_context_search, decompose_query, knowledge_summary, compare_documents, trace_source, etc.
 
 ## Conventions
 

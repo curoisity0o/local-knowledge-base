@@ -504,6 +504,122 @@ def create_knowledge_summary_tool(vector_store, llm_manager=None) -> Callable:
     return knowledge_summary
 
 
+def create_compare_documents_tool(vector_store, llm_manager=None):
+    """创建文档对比工具：分别检索两个主题，由 LLM 生成结构化对比分析"""
+
+    def compare_documents(topic_a: str, topic_b: str, k: int = 4) -> str:
+        """
+        对比知识库中两个主题的内容差异，返回结构化分析。
+
+        参数:
+            topic_a: 第一个主题
+            topic_b: 第二个主题
+            k: 每个主题检索的文档数（默认4）
+        """
+        try:
+            # 分别检索两个主题
+            docs_a = vector_store.hybrid_search(topic_a, k=k)
+            docs_b = vector_store.hybrid_search(topic_b, k=k)
+
+            if not docs_a and not docs_b:
+                return f"知识库中未找到关于「{topic_a}」或「{topic_b}」的相关内容"
+
+            text_a = "\n".join(
+                f"- {d.page_content[:300]}"
+                for d in docs_a
+            ) if docs_a else "（无相关内容）"
+            text_b = "\n".join(
+                f"- {d.page_content[:300]}"
+                for d in docs_b
+            ) if docs_b else "（无相关内容）"
+
+            if llm_manager is None:
+                return (
+                    f"=== {topic_a} ===\n{text_a}\n\n"
+                    f"=== {topic_b} ===\n{text_b}\n\n"
+                    f"（LLM 未配置，仅返回原始检索结果）"
+                )
+
+            prompt = (
+                f"请对比以下两组知识库内容，从相同点、差异点、各自特点三个维度分析。\n"
+                f"保持客观，只基于给出的内容。\n\n"
+                f"=== {topic_a} ===\n{text_a}\n\n"
+                f"=== {topic_b} ===\n{text_b}\n\n"
+                f"请用中文输出对比分析："
+            )
+            result = llm_manager.generate(prompt)
+            analysis = result.get("text", "").strip()
+            if not analysis:
+                return "对比分析生成失败"
+            return f"对比分析「{topic_a}」vs「{topic_b}」：\n\n{analysis}"
+        except Exception as e:
+            logger.error(f"文档对比失败: {e}")
+            return f"对比失败: {str(e)}"
+
+    return compare_documents
+
+
+def create_trace_source_tool():
+    """创建答案溯源工具：将答案中的句子映射回检索到的文档"""
+
+    def trace_source(answer: str, documents: list) -> str:
+        """
+        对已生成的答案进行逐句溯源，检查每句话在检索文档中是否有依据。
+
+        参数:
+            answer: 已生成的答案文本
+            documents: 检索到的文档内容列表（每项为字符串）
+        """
+        import re
+
+        # 按句子拆分答案
+        sentences = re.split(r"(?<=[。！？.!?\n])\s*", answer)
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 2]
+
+        if not sentences:
+            return "答案为空，无法溯源"
+
+        results = []
+        for sent in sentences:
+            # 在每个文档中查找最长公共子串（简化为子串包含检测）
+            best_match = None
+            best_overlap = 0
+
+            for i, doc_text in enumerate(documents):
+                if not isinstance(doc_text, str):
+                    doc_text = str(doc_text)
+                # 提取句子中的关键片段（连续 4 个字以上）在文档中出现
+                for length in range(min(len(sent), 20), 3, -1):
+                    for start in range(len(sent) - length + 1):
+                        fragment = sent[start:start + length]
+                        if fragment in doc_text and length > best_overlap:
+                            best_overlap = length
+                            best_match = f"文档{i + 1}"
+                            break
+                    if best_overlap >= len(sent) * 0.6:
+                        break  # 覆盖率够高，不需要继续
+
+            confidence = min(best_overlap / max(len(sent), 1), 1.0) if best_overlap > 0 else 0.0
+            results.append({
+                "sentence": sent[:60] + ("..." if len(sent) > 60 else ""),
+                "source": best_match or "无法溯源",
+                "confidence": round(confidence, 2),
+            })
+
+        # 格式化输出
+        lines = []
+        for r in results:
+            icon = "✓" if r["confidence"] >= 0.3 else "✗"
+            lines.append(f"{icon} [{r['source']}] (置信度: {r['confidence']}) {r['sentence']}")
+
+        traced = sum(1 for r in results if r["confidence"] >= 0.3)
+        total = len(results)
+        header = f"溯源结果: {traced}/{total} 句有依据\n"
+        return header + "\n".join(lines)
+
+    return trace_source
+
+
 def get_default_tools(
     vector_store=None, llm_manager=None, base_path: str = "./data"
 ) -> ToolRegistry:
@@ -587,6 +703,39 @@ def get_default_tools(
                     "max_docs": {"type": "integer", "description": "最多参考的文档数，默认5"},
                 },
                 "required": ["topic"],
+            },
+        )
+
+        registry.register(
+            "compare_documents",
+            create_compare_documents_tool(vector_store, llm_manager),
+            description="对比知识库中两个主题的差异，返回结构化分析（相同点/差异点/各自特点）",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "topic_a": {"type": "string", "description": "第一个主题"},
+                    "topic_b": {"type": "string", "description": "第二个主题"},
+                    "k": {"type": "integer", "description": "每个主题检索的文档数，默认4"},
+                },
+                "required": ["topic_a", "topic_b"],
+            },
+        )
+
+        registry.register(
+            "trace_source",
+            create_trace_source_tool(),
+            description="对已生成的答案逐句溯源，检查每句话在检索文档中是否有依据",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string", "description": "已生成的答案文本"},
+                    "documents": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "检索到的文档内容列表",
+                    },
+                },
+                "required": ["answer", "documents"],
             },
         )
 

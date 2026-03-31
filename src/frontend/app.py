@@ -691,7 +691,13 @@ def render_chat_interface():
                     if "sources" in message:
                         with st.expander("查看来源"):
                             for source in message["sources"]:
-                                st.markdown(f"- {source}")
+                                if isinstance(source, dict):
+                                    name = source.get("source", "未知")
+                                    score = source.get("score")
+                                    text = f"- {name}" + (f" (相关度: {score})" if score else "")
+                                else:
+                                    text = f"- {source}"
+                                st.markdown(text)
 
         # 检查是否正在处理中，显示提示而不是输入框
         is_processing = st.session_state.get("processing", False)
@@ -807,17 +813,26 @@ def render_chat_interface():
                                         seen = set()
                                         unique_sources = []
                                         for s in sources:
-                                            # 提取文件名作为唯一标识
-                                            filename = s.split("/")[-1].split("\\")[-1]
+                                            # 兼容 dict 和 str 两种格式
+                                            name = s.get("source", s) if isinstance(s, dict) else s
+                                            filename = name.split("/")[-1].split("\\")[-1]
                                             if filename not in seen:
                                                 seen.add(filename)
                                                 unique_sources.append(s)
                                         for i, source in enumerate(unique_sources):
+                                            # 兼容 dict 和 str 两种格式
+                                            if isinstance(source, dict):
+                                                name = source.get("source", "未知")
+                                                score = source.get("score")
+                                            else:
+                                                name = source
+                                                score = None
                                             # 只显示文件名
-                                            filename = source.split("/")[-1].split(
+                                            filename = name.split("/")[-1].split(
                                                 "\\"
                                             )[-1]
-                                            st.markdown(f"{i + 1}. {filename}")
+                                            score_text = f" (相关度: {score})" if score else ""
+                                            st.markdown(f"{i + 1}. {filename}{score_text}")
                     else:
                         error_msg = f"查询失败: {response.status_code}"
                         st.error(error_msg)
