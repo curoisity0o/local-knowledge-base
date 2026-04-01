@@ -1,16 +1,15 @@
 """
 Gradio 前端界面
-作为 Streamlit 的轻量替代方案，提供简洁的知识库问答界面。
+本地知识库系统的统一前端，提供问答、文档管理和系统监控功能。
 
 启动方式：
     python src/frontend/gradio_app.py
-    # 或通过 FastAPI 后端挂载（见 src/api/main.py）
 """
 
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
@@ -53,38 +52,45 @@ def _post(endpoint: str, json: Optional[Dict] = None, files=None, data=None, tim
         return None
 
 
-def check_api_health() -> Tuple[bool, str]:
-    """检查 API 是否可达"""
-    data = _get("/health")
-    if data:
-        return True, "✅ API 服务正常"
-    return False, f"❌ 无法连接到 API 服务 ({API_BASE_URL})"
+# ─────────────────────────────────────────────────────────────
+# 问答功能
+# ─────────────────────────────────────────────────────────────
 
 
 def query_knowledge_base(
     question: str,
-    history: List[Tuple[str, str]],
+    history: List[Dict],
     use_rag: bool = True,
     provider: str = "auto",
     top_k: int = 5,
-) -> Tuple[List[Tuple[str, str]], str]:
-    """向知识库提问，返回更新的历史和来源信息"""
+    session_id: str = "",
+) -> Tuple[List[Dict], str]:
+    """向知识库提问，返回更新的历史和来源信息
+
+    history 格式: [{"role": "user/assistant", "content": "..."}, ...]
+    """
     if not question.strip():
         return history, "请输入问题"
-
-    # 构建对话历史（最近 5 轮）
-    msg_history = []
-    for user_msg, bot_msg in history[-5:]:
-        msg_history.append({"role": "user", "content": user_msg})
-        msg_history.append({"role": "assistant", "content": bot_msg})
 
     payload = {
         "question": question,
         "top_k": top_k,
         "provider": provider if provider != "auto" else None,
         "use_rag": use_rag,
-        "history": msg_history,
     }
+
+    # 优先使用 session_id（服务端管理历史）
+    if session_id:
+        payload["session_id"] = session_id
+    else:
+        # 向后兼容：前端传历史
+        msg_history = []
+        for msg in history[-10:]:  # 最近 10 条
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role in ("user", "assistant"):
+                msg_history.append({"role": role, "content": content})
+        payload["history"] = msg_history
 
     data = _post("/api/v1/query", json=payload, timeout=180)
 
@@ -94,6 +100,20 @@ def query_knowledge_base(
     else:
         answer = data.get("answer", "未获取到答案")
         sources = data.get("sources", [])
+        images = data.get("images", [])
+
+        # 构建来源文本（含图片）
+        parts = []
+        if images:
+            img_lines = []
+            for img in images:
+                img_path = img.get("path", "")
+                caption = img.get("caption", "")
+                if img_path:
+                    cap = f" {caption}" if caption else ""
+                    img_lines.append(f"![{caption}]({img_path}){cap}")
+            if img_lines:
+                parts.append("### 📷 相关图片\n" + "\n\n".join(img_lines))
 
         if sources:
             source_lines = []
@@ -104,12 +124,22 @@ def query_knowledge_base(
                 score_text = f" (相关度: {score})" if score else ""
                 content_text = f"\n> {content_preview[:120].replace(chr(10), ' ')}…" if content_preview else ""
                 source_lines.append(f"**[{i}] {src_name}**{score_text}{content_text}")
-            sources_text = "\n\n".join(source_lines)
+            parts.append("### 📚 参考来源\n" + "\n\n".join(source_lines))
         else:
-            sources_text = "_未找到相关参考文档_"
+            parts.append("_未找到相关参考文档_")
 
-    history = history + [(question, answer)]
+        sources_text = "\n\n---\n\n".join(parts)
+
+    history = history + [
+        {"role": "user", "content": question},
+        {"role": "assistant", "content": answer},
+    ]
     return history, sources_text
+
+
+# ─────────────────────────────────────────────────────────────
+# 文档管理功能
+# ─────────────────────────────────────────────────────────────
 
 
 def upload_and_process_file(file_obj) -> str:
@@ -120,7 +150,6 @@ def upload_and_process_file(file_obj) -> str:
     file_path = file_obj.name
     file_name = Path(file_path).name
 
-    # 上传文件
     with open(file_path, "rb") as f:
         files = {"file": (file_name, f)}
         upload_data = _post("/api/v1/documents/upload", files=files)
@@ -128,7 +157,6 @@ def upload_and_process_file(file_obj) -> str:
     if not upload_data or not upload_data.get("success"):
         return f"❌ 上传失败: {upload_data}"
 
-    # 处理文件
     process_data = _post("/api/v1/documents/process", json={"filenames": [file_name]})
 
     if not process_data:
@@ -137,8 +165,8 @@ def upload_and_process_file(file_obj) -> str:
     processed = process_data.get("processed_files", [])
     if processed:
         chunks = processed[0].get("chunks_count", 0)
-        return f"✅ 文件 **{file_name}** 处理完成，生成 **{chunks}** 个检索片段"
-    return f"✅ 文件已上传并处理"
+        return f"✅ **{file_name}** 处理完成，生成 **{chunks}** 个检索片段"
+    return f"✅ {file_name} 已上传并处理"
 
 
 def list_documents() -> str:
@@ -151,7 +179,7 @@ def list_documents() -> str:
     if not docs:
         return "知识库为空，请先上传文档"
 
-    lines = [f"| 文件名 | 大小 | 片段数 |", "|--------|------|--------|"]
+    lines = ["| 文件名 | 大小 | 片段数 |", "|--------|------|--------|"]
     for doc in docs:
         name = doc.get("filename", "未知")
         size_kb = doc.get("size", 0) // 1024
@@ -174,28 +202,91 @@ def delete_document(filename: str) -> str:
 
     result = requests.delete(f"{API_BASE_URL}/api/v1/documents/{filename}", timeout=30)
     if result.status_code == 200:
-        return f"✅ 文档 '{filename}' 已删除"
+        return f"✅ '{filename}' 已删除"
     return f"❌ 删除失败: {result.text}"
 
 
+# ─────────────────────────────────────────────────────────────
+# 系统状态功能
+# ─────────────────────────────────────────────────────────────
+
+
 def get_system_stats() -> str:
-    """获取系统状态"""
+    """获取完整系统状态（API + 文档统计 + 健康检查）"""
+    lines = ["### 📊 系统状态"]
+
+    # API 健康检查
     health = _get("/health")
-    stats = _get("/api/v1/stats")
-
-    lines = ["### 系统状态"]
-
     if health:
         status = health.get("status", "unknown")
-        lines.append(f"- **API 状态**: {status}")
+        icon = "🟢" if status == "healthy" else "🔴"
+        lines.append(f"{icon} **API 状态**: {status}")
+    else:
+        lines.append("🔴 **API 状态**: 不可达")
 
+    # 文档统计
+    stats = _get("/api/v1/documents/stats")
     if stats:
-        doc_count = stats.get("document_count", 0)
-        vector_count = stats.get("vector_count", 0)
-        lines.append(f"- **文档数**: {doc_count}")
-        lines.append(f"- **向量数**: {vector_count}")
+        total = stats.get("total_documents", 0)
+        indexed = stats.get("indexed_documents", 0)
+        total_size = stats.get("total_size", 0) / (1024 * 1024)
+        lines.append(f"- **文档总数**: {total}")
+        lines.append(f"- **已索引**: {indexed}")
+        if total > 0:
+            lines.append(f"- **索引率**: {indexed / total * 100:.0f}%")
+        lines.append(f"- **存储大小**: {total_size:.1f} MB")
+
+    # 向量存储
+    vs_status = _get("/health/vectorstore")
+    if vs_status:
+        vs_ready = vs_status.get("ready", False)
+        icon = "🟢" if vs_ready else "🔴"
+        lines.append(f"{icon} **向量存储**: {'就绪' if vs_ready else '未就绪'}")
+
+    # 本地模型
+    local_status = _get("/health/local")
+    if local_status:
+        available = local_status.get("available", False)
+        icon = "🟢" if available else "🔴"
+        model = local_status.get("model", "未知")
+        lines.append(f"{icon} **本地模型**: {model} ({'可用' if available else '不可用'})")
 
     return "\n".join(lines) if len(lines) > 1 else "❌ 无法获取状态信息"
+
+
+def warmup_model() -> str:
+    """预热模型"""
+    data = _post("/api/v1/models/warmup", timeout=120)
+    if data and data.get("success"):
+        return "✅ 模型预热完成，后续问答会更快"
+    return "❌ 预热失败，请检查 API 服务"
+
+
+# ─────────────────────────────────────────────────────────────
+# 会话管理功能
+# ─────────────────────────────────────────────────────────────
+
+
+def create_session_fn() -> str:
+    """创建新会话，返回 session_id"""
+    data = _post("/api/v1/sessions", json={"user_id": "default"})
+    if data:
+        return data.get("session_id", "")
+    return ""
+
+
+def clear_session_fn(session_id: str) -> Tuple[List[Dict], str, str]:
+    """清空会话消息（保留会话）"""
+    if session_id:
+        _post(f"/api/v1/sessions/{session_id}/clear")
+    return [], "_已清空_", session_id
+
+
+def delete_session_fn(session_id: str) -> Tuple[List[Dict], str, str]:
+    """删除会话"""
+    if session_id:
+        requests.delete(f"{API_BASE_URL}/api/v1/sessions/{session_id}", timeout=5)
+    return [], "_会话已删除_", ""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -208,9 +299,7 @@ def build_interface():
     try:
         import gradio as gr
     except ImportError:
-        raise ImportError(
-            "Gradio 未安装，请运行: pip install gradio>=4.0.0"
-        )
+        raise ImportError("Gradio 未安装，请运行: pip install gradio>=4.0.0")
 
     # ── 主题与样式 ──────────────────────────────────────────
     theme = gr.themes.Soft(
@@ -224,8 +313,6 @@ def build_interface():
         title="本地知识库 · Local Knowledge Base",
         css="""
         .source-box { background: #f8f9fa; border-radius: 8px; padding: 12px; }
-        .status-ok  { color: #28a745; font-weight: bold; }
-        .status-err { color: #dc3545; font-weight: bold; }
         footer { display: none !important; }
         """,
     ) as demo:
@@ -238,14 +325,16 @@ def build_interface():
             """
         )
 
-        # ── Tab: 问答 ──────────────────────────────────────
+        # ── Tab: 问答（默认打开）────────────────────────────
         with gr.Tab("💬 智能问答"):
+            session_state = gr.State("")
+
             with gr.Row():
                 with gr.Column(scale=3):
                     chatbot = gr.Chatbot(
                         label="对话",
                         height=500,
-                        bubble_full_width=False,
+                        type="messages",
                         show_copy_button=True,
                     )
                     with gr.Row():
@@ -257,7 +346,9 @@ def build_interface():
                         )
                         submit_btn = gr.Button("发送 ▶", variant="primary", scale=1)
                     with gr.Row():
+                        new_session_btn = gr.Button("➕ 新对话", size="sm")
                         clear_btn = gr.Button("🗑 清空对话", size="sm")
+                        delete_session_btn = gr.Button("❌ 删除会话", size="sm")
 
                 with gr.Column(scale=2):
                     gr.Markdown("### 🔍 参考来源")
@@ -267,9 +358,7 @@ def build_interface():
                     )
                     gr.Markdown("### ⚙️ 检索设置")
                     with gr.Row():
-                        use_rag_toggle = gr.Checkbox(
-                            label="启用知识库检索", value=True
-                        )
+                        use_rag_toggle = gr.Checkbox(label="启用知识库检索", value=True)
                         provider_dropdown = gr.Dropdown(
                             choices=["auto", "local", "deepseek", "openai", "kimi"],
                             value="auto",
@@ -277,29 +366,52 @@ def build_interface():
                         )
                     top_k_slider = gr.Slider(
                         minimum=1, maximum=20, value=5, step=1,
-                        label="检索文档数 (top_k)"
+                        label="检索文档数 (top_k)",
                     )
 
             # 事件绑定
-            def _submit(question, history, use_rag, provider, top_k):
-                return query_knowledge_base(question, history, use_rag, provider, int(top_k))
+            def _submit(question, history, use_rag, provider, top_k, session_id):
+                if not question or not question.strip():
+                    return history, sources_box.value
+                return query_knowledge_base(question, history, use_rag, provider, int(top_k), session_id)
 
             question_input.submit(
                 fn=_submit,
-                inputs=[question_input, chatbot, use_rag_toggle, provider_dropdown, top_k_slider],
+                inputs=[question_input, chatbot, use_rag_toggle, provider_dropdown, top_k_slider, session_state],
                 outputs=[chatbot, sources_box],
             ).then(lambda: "", outputs=question_input)
 
             submit_btn.click(
                 fn=_submit,
-                inputs=[question_input, chatbot, use_rag_toggle, provider_dropdown, top_k_slider],
+                inputs=[question_input, chatbot, use_rag_toggle, provider_dropdown, top_k_slider, session_state],
                 outputs=[chatbot, sources_box],
             ).then(lambda: "", outputs=question_input)
 
-            clear_btn.click(fn=lambda: ([], "_已清空_"), outputs=[chatbot, sources_box])
+            # 清空对话：重置 chatbot + session_state
+            clear_btn.click(
+                fn=clear_session_fn,
+                inputs=[session_state],
+                outputs=[chatbot, sources_box, session_state],
+            )
+
+            # 新建会话：创建新 session + 清空 chatbot
+            new_session_btn.click(
+                fn=create_session_fn,
+                outputs=[session_state],
+            ).then(fn=lambda: ([], "_新对话已创建_"), outputs=[chatbot, sources_box])
+
+            # 删除会话：删除 + 清空 chatbot + 重置 session_state
+            delete_session_btn.click(
+                fn=delete_session_fn,
+                inputs=[session_state],
+                outputs=[chatbot, sources_box, session_state],
+            )
 
         # ── Tab: 文档管理 ──────────────────────────────────
         with gr.Tab("📂 文档管理"):
+            # 文档统计
+            doc_stats = gr.Markdown("_加载中..._")
+
             with gr.Row():
                 with gr.Column():
                     gr.Markdown("### 上传文档")
@@ -327,7 +439,7 @@ def build_interface():
                 fn=upload_and_process_file,
                 inputs=file_upload,
                 outputs=upload_status,
-            ).then(fn=list_documents, outputs=docs_display)
+            ).then(fn=list_documents, outputs=docs_display).then(fn=get_doc_stats, outputs=doc_stats)
 
             refresh_btn.click(fn=list_documents, outputs=docs_display)
 
@@ -335,18 +447,36 @@ def build_interface():
                 fn=delete_document,
                 inputs=delete_input,
                 outputs=delete_status,
-            ).then(fn=list_documents, outputs=docs_display)
+            ).then(fn=list_documents, outputs=docs_display).then(fn=get_doc_stats, outputs=doc_stats)
+
+            # 页面加载时自动获取文档列表和统计
+            demo.load(fn=get_doc_stats, outputs=doc_stats)
 
         # ── Tab: 系统状态 ──────────────────────────────────
         with gr.Tab("📊 系统状态"):
-            status_display = gr.Markdown("_点击「刷新状态」查看_")
-            refresh_status_btn = gr.Button("🔄 刷新状态")
+            status_display = gr.Markdown("_加载中..._")
+            with gr.Row():
+                refresh_status_btn = gr.Button("🔄 刷新状态")
+                warmup_btn = gr.Button("🔥 预热模型", variant="secondary")
+
             refresh_status_btn.click(fn=get_system_stats, outputs=status_display)
+            warmup_btn.click(fn=warmup_model, outputs=status_display)
 
             # 页面加载时自动刷新
             demo.load(fn=get_system_stats, outputs=status_display)
 
     return demo
+
+
+def get_doc_stats() -> str:
+    """获取文档统计摘要"""
+    stats = _get("/api/v1/documents/stats")
+    if not stats:
+        return "❌ 无法获取文档统计"
+    total = stats.get("total_documents", 0)
+    indexed = stats.get("indexed_documents", 0)
+    total_size = stats.get("total_size", 0) / (1024 * 1024)
+    return f"📊 **{indexed}/{total}** 个文档已索引 · {total_size:.1f} MB"
 
 
 # ─────────────────────────────────────────────────────────────

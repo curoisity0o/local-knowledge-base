@@ -81,6 +81,21 @@ class RAGChain:
         self.crag_threshold = float(get_config("rag.corrective.quality_threshold", 0.3))
         self.crag_max_retries = int(get_config("rag.corrective.max_retries", 1))
 
+        # History-Aware Retrieval 配置
+        self.history_aware_enabled = get_config("rag.history_aware.enabled", True)
+        self.history_aware_max_history = int(
+            get_config("rag.history_aware.max_history_for_rewrite", 5)
+        )
+
+        # 历史管理配置
+        self.history_max_turns = int(get_config("rag.history.max_turns", 20))
+        self.history_token_budget_ratio = float(
+            get_config("rag.history.token_budget_ratio", 0.25)
+        )
+        self.history_summary_threshold = int(
+            get_config("rag.history.summary_threshold", 10)
+        )
+
         # 答案溯源验证配置
         self.citation_verify_enabled = get_config(
             "rag.citation_verification.enabled", True
@@ -135,9 +150,11 @@ class RAGChain:
             documents = self.document_processor.process_file(file_path)
             logger.info(f"文档处理完成，生成 {len(documents)} 个片段")
 
-            # 2. 添加到向量存储
+            # 2. 添加到向量存储（先删除同名旧文档，防止重复累积）
             ids = []
             if self.vector_store:
+                normalized_path = str(Path(file_path).resolve())
+                self.vector_store.delete_by_source(normalized_path)
                 ids = self.vector_store.add_documents(documents)
                 logger.info(f"文档已添加到向量存储，生成 {len(ids)} 个向量")
 
@@ -221,16 +238,19 @@ class RAGChain:
 
             effective_top_k = top_k if top_k is not None else self.retrieval_top_k
 
-            # 1. 检索相关文档
+            # 0. History-Aware: 用历史改写查询，用于检索
+            retrieval_question = self._rewrite_query_with_history(question, history)
+
+            # 1. 检索相关文档（用改写后的查询）
             if self.vector_store:
                 retrieved_docs = self._retrieve_documents(
-                    question, k=effective_top_k, mode=retrieval_mode
+                    retrieval_question, k=effective_top_k, mode=retrieval_mode
                 )
 
                 # 2. CRAG: 评估检索质量，质量低时改写查询重试
                 if self.crag_enabled and retrieved_docs:
                     retrieved_docs = self._corrective_retrieve(
-                        question, retrieved_docs, effective_top_k
+                        retrieval_question, retrieved_docs, effective_top_k
                     )
 
                 # 2. 重排序（如启用）
@@ -268,6 +288,7 @@ class RAGChain:
                     unique_sources.append({"source": src, "score": round(score, 3)})
 
             # 6. 生成回答
+            images = []
             if self.llm_manager and context:
                 prompt = self._build_prompt(question, context, history)
                 result = self.llm_manager.generate(prompt, provider=provider)
@@ -285,16 +306,22 @@ class RAGChain:
                 else:
                     citation_report = []
             elif self.llm_manager:
-                # 无检索结果但有 LLM，直接回答
+                # 无检索结果但有 LLM
                 history_context = self._build_history_section(history)
                 if history_context:
                     prompt = (
                         f"【对话历史】\n{history_context}\n\n"
                         f"用户问题：{question}\n\n"
-                        f"知识库中没有找到相关信息，请结合对话历史如实回答。"
+                        f"知识库中没有找到与当前问题相关的文档。"
+                        f"请如实回答：如果你不确定或文档中没有相关信息，"
+                        f"请直接说明'根据提供的文档，无法回答这个问题'，不要编造答案。"
                     )
                 else:
-                    prompt = question
+                    prompt = (
+                        f"用户问题：{question}\n\n"
+                        f"知识库中没有找到相关文档。"
+                        f"请如实回答：如果你不确定，请直接说明无法回答，不要编造答案。"
+                    )
                 result = self.llm_manager.generate(prompt, provider=provider)
                 answer = result.get("text", "生成失败")
                 metadata = result.get("metadata", {})
@@ -304,6 +331,11 @@ class RAGChain:
                 answer = "知识库为空且 LLM 未初始化，请先添加文档并配置 LLM。"
                 metadata = {"provider": "none"}
                 citation_report = []
+                unique_sources = []
+
+            # 8. 从检索文档中提取图片路径
+            if retrieved_docs and not images:
+                images = self._extract_images(retrieved_docs)
 
             return {
                 "success": True,
@@ -311,6 +343,7 @@ class RAGChain:
                 "answer": answer,
                 "sources": unique_sources,
                 "num_sources": len(unique_sources),
+                "images": images,
                 "processing_time": time.time() - start_time,
                 "metadata": metadata,
                 "citation_report": citation_report,
@@ -492,6 +525,71 @@ class RAGChain:
         # 规则 fallback: 提取关键词重新组合
         return self._keyword_rewrite(question)
 
+    def _rewrite_query_with_history(
+        self, question: str, history: Optional[List[Dict[str, str]]]
+    ) -> str:
+        """用对话历史将指代性问题改写为独立查询（History-Aware Retrieval）
+
+        核心思想：检索时只用改写后的独立查询，不传入原始历史。
+        原始历史仅在生成阶段使用。
+
+        示例：
+            历史: [用户: "介绍 DeepSeek-V2", 助手: "DeepSeek-V2 是..."]
+            当前: "它的推理能力怎么样？"
+            改写: "DeepSeek-V2 的推理能力怎么样？"
+        """
+        if not history or not self.history_aware_enabled:
+            return question
+
+        # 只取最近 N 轮参与改写
+        recent = history[-self.history_aware_max_history * 2 :]
+        if not recent:
+            return question
+
+        # 快速检测是否包含指代词（如果纯新话题则无需改写）
+        import re
+
+        pronoun_pattern = re.compile(
+            r"(它|它们|他|她|这|那|这个|那个|这些|那些|其|该|上述|前者|后者|上面|之前|刚才)"
+        )
+        if not pronoun_pattern.search(question):
+            # 即使没有明确指代词，有历史时也改写以补充上下文
+            # 但为了减少不必要的 LLM 调用，仅在历史足够丰富时改写
+            if len(recent) < 2:
+                return question
+
+        if self.llm_manager is None:
+            return question
+
+        try:
+            history_text = "\n".join(
+                f"{'用户' if m.get('role') == 'user' else '助手'}：{m.get('content', '')}"
+                for m in recent
+            )
+
+            prompt = (
+                "根据对话历史，将用户的最新问题改写为一个独立、完整的问题。\n"
+                "改写后的问题应该包含所有必要的上下文信息，"
+                "使其在没有对话历史的情况下也能被理解。\n"
+                "只输出改写后的问题，不要解释。\n\n"
+                f"对话历史：\n{history_text}\n\n"
+                f"最新问题：{question}\n\n"
+                "改写后的问题："
+            )
+
+            result = self.llm_manager.generate(prompt)
+            rewritten = result.get("text", "").strip()
+
+            if rewritten and len(rewritten) > 2:
+                logger.info(
+                    f"History-Aware: '{question[:30]}' → '{rewritten[:30]}'"
+                )
+                return rewritten
+        except Exception as e:
+            logger.warning(f"History-Aware 查询改写失败: {e}")
+
+        return question
+
     @staticmethod
     def _keyword_rewrite(question: str) -> str:
         """规则改写: 提取关键词，去掉常见提问词后重组。"""
@@ -566,18 +664,122 @@ class RAGChain:
         logger.info(f"上下文裁剪完成: 保留 {len(truncated_parts)} 个文档，丢弃 {dropped} 个")
         return "\n---\n".join(truncated_parts)
 
-    @staticmethod
     def _build_history_section(
+        self,
         history: Optional[List[Dict[str, str]]],
+        available_context_tokens: Optional[int] = None,
     ) -> str:
-        """构建历史对话文本区段"""
+        """构建历史对话文本区段（Token 感知动态窗口 + 摘要压缩）
+
+        策略：Sliding Window + Summary 混合
+        - 超过 summary_threshold 轮的旧历史用 LLM 生成摘要
+        - 最近 N 轮保留原文，并按 token 预算裁剪
+
+        Args:
+            history: 对话历史列表
+            available_context_tokens: 可用于历史的 token 预算。
+                如果提供，按预算动态裁剪；否则退回硬上限。
+        """
         if not history:
             return ""
+
+        # 硬上限
+        effective_history = history[-self.history_max_turns * 2 :]
+
+        # 摘要压缩：超过阈值的旧历史生成摘要
+        threshold_msgs = self.history_summary_threshold * 2
+        if len(effective_history) > threshold_msgs and self.llm_manager is not None:
+            old_part = effective_history[:-threshold_msgs]
+            recent_part = effective_history[-threshold_msgs:]
+
+            summary = self._summarize_history(old_part)
+            if summary:
+                # 摘要 + 最近 N 轮原文
+                effective_history = [{"role": "system", "content": f"【历史摘要】{summary}"}] + recent_part
+            else:
+                # 摘要失败，退回简单裁剪
+                effective_history = recent_part
+        else:
+            # 未超过阈值，直接使用（后续由 token 预算裁剪）
+            pass
+
+        # Token 预算裁剪
+        if available_context_tokens is not None and available_context_tokens > 0:
+            max_history_tokens = int(
+                available_context_tokens * self.history_token_budget_ratio
+            )
+            selected = []
+            used_tokens = 0
+            # 从最新开始，逐条累加直到预算用完
+            for msg in reversed(effective_history):
+                content = msg.get("content", "")
+                msg_tokens = estimate_tokens(content) + 10  # +10 给角色标签
+                if used_tokens + msg_tokens > max_history_tokens:
+                    break
+                selected.insert(0, msg)
+                used_tokens += msg_tokens
+            effective_history = selected
+
+            if len(effective_history) < len(history):
+                logger.debug(
+                    f"历史裁剪: {len(history)} → {len(effective_history)} 条"
+                    f" (预算 {max_history_tokens} tokens)"
+                )
+
+        if not effective_history:
+            return ""
+
         parts = []
-        for msg in history[-6:]:  # 最近6轮
-            role = "用户" if msg.get("role") == "user" else "助手"
-            parts.append(f"{role}：{msg.get('content', '')}")
+        for msg in effective_history:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "system":
+                parts.append(content)
+            else:
+                label = "用户" if role == "user" else "助手"
+                parts.append(f"{label}：{content}")
         return "\n".join(parts)
+
+    def _summarize_history(self, old_messages: List[Dict[str, str]]) -> Optional[str]:
+        """将旧对话历史压缩为摘要
+
+        Args:
+            old_messages: 早期的对话消息列表
+
+        Returns:
+            压缩后的摘要文本，失败时返回 None
+        """
+        if not old_messages:
+            return None
+
+        try:
+            history_text = "\n".join(
+                f"{'用户' if m.get('role') == 'user' else '助手'}：{m.get('content', '')}"
+                for m in old_messages
+            )
+
+            # 限制输入长度，避免摘要本身成本过高
+            if len(history_text) > 3000:
+                history_text = history_text[:3000] + "\n...(历史过长已截断)"
+
+            prompt = (
+                "请将以下对话历史压缩为简洁的摘要（200字以内），"
+                "保留关键信息：讨论了什么主题、得出了什么结论、提到了哪些重要实体。\n"
+                "只输出摘要，不要解释。\n\n"
+                f"对话历史：\n{history_text}\n\n摘要："
+            )
+
+            result = self.llm_manager.generate(prompt)
+            summary = result.get("text", "").strip()
+
+            if summary and len(summary) > 10:
+                logger.info(f"历史摘要生成成功: {len(old_messages)} 条 → {len(summary)} 字符")
+                return summary
+
+        except Exception as e:
+            logger.warning(f"历史摘要生成失败: {e}")
+
+        return None
 
     def _build_prompt(
         self,
@@ -585,8 +787,16 @@ class RAGChain:
         context: str,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
-        """构建提示词（统一入口，含反幻觉约束、引用标注、历史对话）"""
-        history_section = self._build_history_section(history)
+        """构建提示词（统一入口，含反幻觉约束、引用标注、历史对话）
+
+        Token 预算分配：
+        - context 已经被 _build_context 裁剪到 max_context_tokens 以内
+        - 历史从 context 的剩余预算中分配 token_budget_ratio 比例
+        """
+        # 计算历史可用 token 预算
+        context_tokens = estimate_tokens(context) if context else 0
+        remaining_budget = max(0, self.max_context_tokens - context_tokens)
+        history_section = self._build_history_section(history, remaining_budget)
         history_block = f"\n\n【对话历史】\n{history_section}\n" if history_section else ""
 
         # 反幻觉约束
@@ -621,6 +831,63 @@ class RAGChain:
             f"参考文档：\n{context}\n\n"
             f"用户问题：{question}\n\n请用中文回答。"
         )
+
+    @staticmethod
+    def _extract_images(documents: List[Document]) -> List[Dict[str, str]]:
+        """从检索文档中提取图片路径，resolve 到本地绝对路径。
+
+        匹配 Markdown 图片语法：![alt](path)
+        路径查找优先级：
+        1. data/images/{doc_name}_images/images/{image_path}
+        2. data/images/{doc_name}_images/{image_path}
+
+        Returns:
+            [{"path": "本地绝对路径", "caption": "图片说明"}, ...]
+        """
+        import re as _re
+        project_root = Path(__file__).parent.parent.parent
+        image_base = project_root / "data" / "images"
+
+        # 收集每个 source 对应的 doc_name
+        source_to_doc_name: Dict[str, str] = {}
+        for doc in documents:
+            src = doc.metadata.get("source", "")
+            if src and src not in source_to_doc_name:
+                doc_name = Path(src).stem.replace(".md", "")
+                source_to_doc_name[src] = doc_name
+
+        seen_paths: set = set()
+        images: List[Dict[str, str]] = []
+
+        for doc in documents:
+            src = doc.metadata.get("source", "")
+            doc_name = source_to_doc_name.get(src, "")
+
+            for match in _re.finditer(r"!\[([^\]]*)\]\(([^)]+)\)", doc.page_content):
+                caption = match.group(1).strip()
+                image_path = match.group(2).strip()
+
+                # 跳过网络 URL 和绝对路径
+                if image_path.startswith("http") or image_path.startswith("/"):
+                    continue
+
+                # 在 data/images/{doc_name}_images/ 下查找
+                resolved = None
+                if doc_name:
+                    doc_images_dir = f"{doc_name}_images"
+                    path1 = image_base / doc_images_dir / "images" / Path(image_path).name
+                    path2 = image_base / doc_images_dir / Path(image_path).name
+                    if path1.exists():
+                        resolved = str(path1)
+                    elif path2.exists():
+                        resolved = str(path2)
+
+                if resolved and resolved not in seen_paths:
+                    seen_paths.add(resolved)
+                    images.append({"path": resolved, "caption": caption})
+
+        logger.info(f"提取到 {len(images)} 张相关图片")
+        return images[:6]  # 限制最多返回 6 张
 
     def _verify_citations(
         self, answer: str, num_docs: int,

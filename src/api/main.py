@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -107,7 +107,10 @@ class QueryRequest(BaseModel):
     provider: Optional[str] = None
     use_rag: Optional[bool] = True
     history: Optional[List[Dict[str, str]]] = Field(
-        default_factory=list, description="对话历史 [{'role': 'user/assistant', 'content': '...'}]"
+        default_factory=list, description="对话历史（向后兼容，优先使用 session_id）"
+    )
+    session_id: Optional[str] = Field(
+        default=None, description="会话 ID，传入后自动管理历史"
     )
     retrieval_mode: Optional[str] = Field(
         default=None,
@@ -130,9 +133,11 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     sources: List[Dict[str, Any]] = []
+    images: List[Dict[str, str]] = []
     provider: str
     response_time: float
     tokens_used: Optional[dict] = None
+    session_id: Optional[str] = None
 
 
 class DocumentProcessRequest(BaseModel):
@@ -145,6 +150,16 @@ class DocumentProcessResponse(BaseModel):
     message: str
     chunks_count: int = 0
     error: Optional[str] = None
+
+
+# 会话管理模型
+class SessionCreateRequest(BaseModel):
+    user_id: str = Field(default="default", description="用户标识")
+    title: Optional[str] = Field(default=None, description="会话标题")
+
+
+class SessionUpdateTitleRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=100, description="新标题")
 
 
 class HealthResponse(BaseModel):
@@ -302,6 +317,9 @@ async def root():
         "endpoints": {
             "health": "/health",
             "query": "/api/v1/query (POST)",
+            "sessions": "/api/v1/sessions (GET/POST)",
+            "session_detail": "/api/v1/sessions/{id} (GET/DELETE)",
+            "session_clear": "/api/v1/sessions/{id}/clear (POST)",
             "upload": "/api/v1/documents/upload (POST)",
             "process": "/api/v1/documents/process (POST)",
             "stats": "/api/v1/stats (GET)",
@@ -419,10 +437,24 @@ async def check_vectorstore() -> dict:
 
 @app.post("/api/v1/query", response_model=QueryResponse)
 async def query_knowledge_base(request: QueryRequest):
-    """查询知识库 — 委托给 RAGChain 完整检索管线"""
+    """查询知识库 — 委托给 RAGChain 完整检索管线，支持会话管理"""
     import time
 
+    from src.core.session_manager import get_session_manager
+
     start_time = time.time()
+    session_id = request.session_id
+    history = request.history or []
+
+    # 如果提供了 session_id，从服务端获取历史
+    if session_id:
+        sm = get_session_manager()
+        session = sm.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"会话不存在: {session_id}")
+        # 合并：session 历史优先，前端传的 history 作为补充
+        if not history:
+            history = sm.get_history(session_id)
 
     try:
         if request.use_rag:
@@ -446,6 +478,7 @@ async def query_knowledge_base(request: QueryRequest):
                     agent_result = agent.process(request.question)
                     answer = agent_result.get("answer", "生成失败")
                     sources = []
+                    images = []
                     provider_used = "agent"
                     tokens = None
                 else:
@@ -454,13 +487,14 @@ async def query_knowledge_base(request: QueryRequest):
                     rag_chain = get_rag_chain()
                     rag_result = rag_chain.query(
                         question=request.question,
-                        history=request.history or [],
+                        history=history,
                         provider=request.provider,
                         top_k=request.top_k,
                         retrieval_mode=request.retrieval_mode,
                     )
                     answer = rag_result.get("answer", "生成失败")
                     sources = rag_result.get("sources", [])
+                    images = rag_result.get("images", [])
                     metadata = rag_result.get("metadata", {})
                     provider_used = metadata.get("provider", "unknown")
                     tokens = rag_result.get("tokens")
@@ -471,7 +505,7 @@ async def query_knowledge_base(request: QueryRequest):
                 rag_chain = get_rag_chain()
                 rag_result = rag_chain.query(
                     question=request.question,
-                    history=request.history or [],
+                    history=history,
                     provider=request.provider,
                     top_k=request.top_k,
                     retrieval_mode=request.retrieval_mode,
@@ -479,13 +513,14 @@ async def query_knowledge_base(request: QueryRequest):
 
                 answer = rag_result.get("answer", "生成失败")
                 sources = rag_result.get("sources", [])
+                images = rag_result.get("images", [])
                 metadata = rag_result.get("metadata", {})
                 provider_used = metadata.get("provider", "unknown")
                 tokens = rag_result.get("tokens")
         else:
             # 直接生成模式（不检索）
             llm_manager = get_llm_manager()
-            history_context = _build_history_context(request.history or [])
+            history_context = _build_history_context(history)
             if history_context:
                 prompt = (
                     f"【对话历史】\n{history_context}\n\n"
@@ -497,22 +532,108 @@ async def query_knowledge_base(request: QueryRequest):
             result = llm_manager.generate(prompt, provider=request.provider)
             answer = result["text"]
             sources = []
+            images = []
             provider_used = result.get("metadata", {}).get("provider", "unknown")
             tokens = result.get("tokens")
+
+        # 持久化消息到会话
+        if session_id:
+            try:
+                sm = get_session_manager()
+                sm.add_message(session_id, "user", request.question)
+                sm.add_message(
+                    session_id, "assistant", answer, sources=sources if sources else None
+                )
+            except Exception as e:
+                logger.warning(f"会话消息持久化失败: {e}")
 
         response_time = time.time() - start_time
 
         return QueryResponse(
             answer=answer,
             sources=sources,
+            images=images,
             provider=provider_used,
             response_time=response_time,
             tokens_used=tokens,
+            session_id=session_id,
         )
 
     except Exception as e:
         logger.error(f"查询失败: {e}")
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+
+# ==================== 会话管理 API ====================
+
+
+@app.post("/api/v1/sessions")
+async def create_session(request: SessionCreateRequest):
+    """创建新会话"""
+    from src.core.session_manager import get_session_manager
+
+    sm = get_session_manager()
+    session = sm.create_session(user_id=request.user_id, title=request.title)
+    return session
+
+
+@app.get("/api/v1/sessions")
+async def list_sessions(
+    user_id: str = "default", limit: int = 50, offset: int = 0,
+):
+    """列出用户的所有会话（按更新时间倒序）"""
+    from src.core.session_manager import get_session_manager
+
+    sm = get_session_manager()
+    return sm.list_sessions(user_id=user_id, limit=limit, offset=offset)
+
+
+@app.get("/api/v1/sessions/{session_id}")
+async def get_session(session_id: str):
+    """获取会话详情（含完整消息列表）"""
+    from src.core.session_manager import get_session_manager
+
+    sm = get_session_manager()
+    session = sm.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return session
+
+
+@app.delete("/api/v1/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """删除会话及其所有消息"""
+    from src.core.session_manager import get_session_manager
+
+    sm = get_session_manager()
+    deleted = sm.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {"success": True, "message": "会话已删除"}
+
+
+@app.put("/api/v1/sessions/{session_id}/title")
+async def update_session_title(session_id: str, request: SessionUpdateTitleRequest):
+    """更新会话标题"""
+    from src.core.session_manager import get_session_manager
+
+    sm = get_session_manager()
+    updated = sm.update_title(session_id, request.title)
+    if not updated:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {"success": True, "message": "标题已更新"}
+
+
+@app.post("/api/v1/sessions/{session_id}/clear")
+async def clear_session_history(session_id: str):
+    """清空会话消息（保留会话本身）"""
+    from src.core.session_manager import get_session_manager
+
+    sm = get_session_manager()
+    cleared = sm.clear_history(session_id)
+    if not cleared:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {"success": True, "message": "对话历史已清空"}
 
 
 class MinerUImportRequest(BaseModel):

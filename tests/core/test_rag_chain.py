@@ -419,3 +419,170 @@ class TestSimpleRAGChain:
 
             with SimpleRAGChain() as chain:
                 assert chain.chain is not None
+
+
+class TestHistoryAwareRetrieval:
+    """History-Aware Query Rewriting 测试"""
+
+    def test_no_history_returns_original(self):
+        """无历史时返回原始问题"""
+        chain = RAGChain()
+        result = chain._rewrite_query_with_history("什么是AI？", None)
+        assert result == "什么是AI？"
+
+    def test_empty_history_returns_original(self):
+        """空历史时返回原始问题"""
+        chain = RAGChain()
+        result = chain._rewrite_query_with_history("什么是AI？", [])
+        assert result == "什么是AI？"
+
+    def test_no_llm_manager_returns_original(self):
+        """无 LLM 管理器时返回原始问题"""
+        chain = RAGChain()
+        chain.llm_manager = None
+        history = [{"role": "user", "content": "介绍DeepSeek"}]
+        result = chain._rewrite_query_with_history("它怎么样？", history)
+        assert result == "它怎么样？"
+
+    def test_with_pronoun_triggers_rewrite(self):
+        """含指代词时触发改写"""
+        chain = RAGChain()
+        chain.history_aware_enabled = True
+        chain.history_aware_max_history = 5
+        chain.llm_manager = MagicMock()
+        chain.llm_manager.generate.return_value = {"text": "DeepSeek-V2 的推理能力怎么样？"}
+
+        history = [
+            {"role": "user", "content": "介绍 DeepSeek-V2"},
+            {"role": "assistant", "content": "DeepSeek-V2 是一个MoE架构的模型。"},
+        ]
+        result = chain._rewrite_query_with_history("它的推理能力怎么样？", history)
+
+        chain.llm_manager.generate.assert_called_once()
+        assert "DeepSeek-V2" in result
+
+    def test_history_aware_disabled_returns_original(self):
+        """禁用时跳过改写"""
+        chain = RAGChain()
+        chain.history_aware_enabled = False
+        chain.llm_manager = MagicMock()
+
+        history = [{"role": "user", "content": "介绍AI"}]
+        result = chain._rewrite_query_with_history("它是什么？", history)
+
+        chain.llm_manager.generate.assert_not_called()
+        assert result == "它是什么？"
+
+
+class TestDynamicHistoryWindow:
+    """Token 感知动态历史窗口测试"""
+
+    def test_empty_history(self):
+        """空历史返回空字符串"""
+        chain = RAGChain()
+        result = chain._build_history_section(None)
+        assert result == ""
+
+    def test_no_budget_returns_default(self):
+        """无预算参数时使用硬上限"""
+        chain = RAGChain()
+        chain.history_max_turns = 6
+
+        history = [{"role": "user", "content": f"问题{i}"} for i in range(20)]
+        result = chain._build_history_section(history)
+        # 应最多保留 12 条（6 轮）
+        assert "用户" in result
+
+    def test_token_budget_truncation(self):
+        """Token 预算裁剪"""
+        chain = RAGChain()
+        chain.history_max_turns = 20
+        chain.history_token_budget_ratio = 0.25
+
+        # 每条消息约 50 token（中文字符 ~1.5 token/字，约 35 字 → ~50 token）
+        long_history = [
+            {"role": "user", "content": "这是一个很长的测试消息内容"}
+            for _ in range(10)
+        ]
+
+        # 给一个能容纳部分消息的预算: 500 * 0.25 = 125 tokens
+        result = chain._build_history_section(long_history, available_context_tokens=500)
+        assert "用户" in result
+        # 预算限制了消息数
+        msg_count = result.count("用户")
+        assert msg_count < len(long_history)
+
+    def test_prompt_includes_history(self):
+        """提示词包含历史对话"""
+        chain = RAGChain()
+        chain.max_context_tokens = 10000
+
+        history = [
+            {"role": "user", "content": "问题1"},
+            {"role": "assistant", "content": "回答1"},
+        ]
+        result = chain._build_prompt("当前问题", "上下文", history)
+        assert "对话历史" in result
+        assert "问题1" in result
+        assert "回答1" in result
+
+    def test_prompt_without_history(self):
+        """无历史时提示词不含历史区块"""
+        chain = RAGChain()
+        result = chain._build_prompt("当前问题", "上下文")
+        assert "对话历史" not in result
+
+
+class TestHistorySummarization:
+    """历史摘要压缩测试"""
+
+    def test_summarize_empty_history(self):
+        """空历史返回 None"""
+        chain = RAGChain()
+        result = chain._summarize_history([])
+        assert result is None
+
+    def test_summarize_no_llm(self):
+        """无 LLM 时返回 None"""
+        chain = RAGChain()
+        chain.llm_manager = None
+        result = chain._summarize_history(
+            [{"role": "user", "content": "test"}]
+        )
+        assert result is None
+
+    def test_summarize_with_llm(self):
+        """LLM 生成摘要成功"""
+        chain = RAGChain()
+        chain.llm_manager = MagicMock()
+        chain.llm_manager.generate.return_value = {
+            "text": "讨论了机器学习的概念和应用。"
+        }
+
+        messages = [
+            {"role": "user", "content": "什么是机器学习？"},
+            {"role": "assistant", "content": "机器学习是AI的分支，通过数据训练模型。"},
+        ]
+        result = chain._summarize_history(messages)
+
+        assert result is not None
+        assert "机器学习" in result
+
+    def test_summarize_truncates_long_history(self):
+        """超长历史在摘要前截断"""
+        chain = RAGChain()
+        chain.llm_manager = MagicMock()
+        chain.llm_manager.generate.return_value = {"text": "摘要"}
+
+        # 生成超长历史
+        messages = [
+            {"role": "user", "content": "问题" + "内容" * 200}
+            for _ in range(5)
+        ]
+
+        result = chain._summarize_history(messages)
+        chain.llm_manager.generate.assert_called_once()
+        # 验证 prompt 被截断
+        call_args = chain.llm_manager.generate.call_args
+        prompt = call_args[0][0] if call_args[0] else call_args[1].get("prompt", "")
+        assert len(prompt) < 5000

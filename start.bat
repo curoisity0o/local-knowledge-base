@@ -12,7 +12,10 @@ echo   [1] Streamlit (default)
 echo   [2] Gradio
 echo.
 set /p choice="Enter choice (1/2): "
-if "%choice%"=="2" set FRONTEND=gradio && goto start_frontend
+if "%choice%"=="2" (
+    set FRONTEND=gradio
+    goto start_frontend
+)
 
 :start_frontend
 echo.

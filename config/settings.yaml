@@ -161,6 +161,17 @@ rag:
     quality_threshold: 0.3    # 关键词覆盖率阈值（低于此值触发改写重试）
     max_retries: 1            # 最大改写重试次数
 
+  # 对话历史感知检索（History-Aware Retrieval）
+  history_aware:
+    enabled: true               # 启用查询改写：将指代性问题改写为独立查询
+    max_history_for_rewrite: 5  # 参与改写的历史轮数
+
+  # 对话历史管理
+  history:
+    max_turns: 20               # 历史硬上限（防止极端情况）
+    token_budget_ratio: 0.25    # 历史占可用 token 比例（P1 动态窗口）
+    summary_threshold: 10       # 超过此轮数时，旧历史压缩为摘要（P2）
+
   # 答案溯源验证
   citation_verification:
     enabled: true             # 启用引用编号校验（检查[文档N]是否真实存在）
