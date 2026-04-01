@@ -275,7 +275,7 @@ class RAGChain:
                         doc_scores[key] = reranker.compute_score(question, doc)
 
             # 4. 构建上下文（按分数排序）
-            context = self._build_context(retrieved_docs, doc_scores)
+            context, num_docs_in_context = self._build_context(retrieved_docs, doc_scores)
 
             # 5. 构建去重的来源列表（附带分数）
             seen_sources = set()
@@ -290,7 +290,7 @@ class RAGChain:
             # 6. 生成回答
             images = []
             if self.llm_manager and context:
-                prompt = self._build_prompt(question, context, history)
+                prompt = self._build_prompt(question, context, history, num_docs=num_docs_in_context)
                 result = self.llm_manager.generate(prompt, provider=provider)
                 answer = result.get("text", "生成失败")
                 metadata = result.get("metadata", {})
@@ -298,10 +298,8 @@ class RAGChain:
                 # 7. 答案溯源验证
                 citation_report = []
                 if self.citation_verify_enabled:
-                    # _build_context 按分数排序后可能截断，取实际传入的文档数
-                    num_docs = len(retrieved_docs)
                     answer, citation_report = self._verify_citations(
-                        answer, num_docs
+                        answer, num_docs_in_context
                     )
                 else:
                     citation_report = []
@@ -609,15 +607,18 @@ class RAGChain:
 
     def _build_context(
         self, documents: List[Document], doc_scores: Optional[Dict[str, float]] = None,
-    ) -> str:
+    ) -> Tuple[str, int]:
         """构建上下文，自动裁剪以适配模型 context window。
 
         Args:
             documents: 检索到的文档列表
             doc_scores: 文档相关性分数映射（page_content -> score），用于按分数排序截断
+
+        Returns:
+            (context_text, actual_doc_count): 上下文文本和实际包含的文档数
         """
         if not documents:
-            return ""
+            return "", 0
 
         # 按相关性分数排序，确保裁剪时丢弃低分文档
         if doc_scores and len(documents) > 1:
@@ -632,13 +633,31 @@ class RAGChain:
         for i, doc in enumerate(documents, 1):
             source = doc.metadata.get("source", "未知来源")
             content = doc.page_content
-            context_parts.append(f"【文档 {i}】来源: {source}\n\n{content}\n")
+
+            # 构建元数据头部：将存储的 metadata 展示给 LLM
+            meta_items = [f"来源: {source}"]
+            title = doc.metadata.get("title", "")
+            if title:
+                meta_items.append(f"标题: {title}")
+            authors = doc.metadata.get("authors", "")
+            if authors:
+                if isinstance(authors, list):
+                    authors = ", ".join(str(a) for a in authors)
+                meta_items.append(f"作者: {authors}")
+            keywords = doc.metadata.get("keywords", "")
+            if keywords:
+                if isinstance(keywords, list):
+                    keywords = ", ".join(str(k) for k in keywords)
+                meta_items.append(f"关键词: {keywords}")
+            meta_header = " | ".join(meta_items)
+
+            context_parts.append(f"【文档 {i}】{meta_header}\n\n{content}\n")
 
         full_context = "\n---\n".join(context_parts)
         estimated_tokens = estimate_tokens(full_context)
 
         if estimated_tokens <= self.max_context_tokens:
-            return full_context
+            return full_context, len(documents)
 
         # 超出限制：逐个添加文档直到接近预算
         logger.warning(
@@ -658,11 +677,11 @@ class RAGChain:
             first = context_parts[0]
             # 截断到预算
             text_budget = self.max_context_tokens * 3  # 粗略字符数
-            return first[:text_budget] + "\n...(文档过长已截断)"
+            return first[:text_budget] + "\n...(文档过长已截断)", 1
 
         dropped = len(context_parts) - len(truncated_parts)
         logger.info(f"上下文裁剪完成: 保留 {len(truncated_parts)} 个文档，丢弃 {dropped} 个")
-        return "\n---\n".join(truncated_parts)
+        return "\n---\n".join(truncated_parts), len(truncated_parts)
 
     def _build_history_section(
         self,
@@ -786,6 +805,7 @@ class RAGChain:
         question: str,
         context: str,
         history: Optional[List[Dict[str, str]]] = None,
+        num_docs: int = 0,
     ) -> str:
         """构建提示词（统一入口，含反幻觉约束、引用标注、历史对话）
 
@@ -799,13 +819,22 @@ class RAGChain:
         history_section = self._build_history_section(history, remaining_budget)
         history_block = f"\n\n【对话历史】\n{history_section}\n" if history_section else ""
 
+        # 引用约束（根据上下文中的实际文档数量动态生成）
+        citation_rule = ""
+        if num_docs > 0:
+            citation_rule = f"""
+3. 引用格式：参考文档中的来源编号为【文档 1】到【文档 {num_docs}】。
+   - 你只能引用这些编号，例如"根据文档1的信息…"、"文档2指出…"
+   - 绝对禁止使用论文原始编号（如 [1]、[32]、[39] 等），这些不是系统文档编号
+   - 绝对禁止编造不存在的文档编号
+"""
+
         # 反幻觉约束
-        hallucination_warning = """
+        hallucination_warning = f"""
 【重要约束】
 1. 只使用参考文档中明确包含的信息，不要捏造、推断或补充文档中没有的概念、术语或数据
 2. 如果文档中没有提到某个概念，直接回答"文档中没有提到"，不要尝试解释或推测
-3. 引用格式：只能引用文档中明确存在的来源（如"根据文档1"、"论文指出"），不要生成虚假引用
-4. 如果问题无法基于文档回答，明确说明"根据提供的文档，无法回答这个问题"
+{citation_rule}4. 如果问题无法基于文档回答，明确说明"根据提供的文档，无法回答这个问题"
 """
 
         # 短事实检测（数值/时间类问题用精简 prompt）

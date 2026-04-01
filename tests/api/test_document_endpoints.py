@@ -16,9 +16,9 @@ sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "src"))
 
 # Mock all dependencies before importing app
- with patch('src.core.config.get_config') as mock_config, \
-      patch('src.core.vector_store.get_config') as mock_vs_config, \
-      patch('src.core.config.get_config') as mock_api_config:
+with patch('src.core.config.get_config') as mock_config, \
+     patch('src.core.vector_store.get_config') as mock_vs_config, \
+     patch('src.core.config.get_config') as mock_api_config:
     
     # 模拟配置返回值
     def get_config_side_effect(*args, **kwargs):

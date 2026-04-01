@@ -30,8 +30,9 @@ class TestRAGChain:
     def test_build_context_empty(self):
         """测试空上下文构建"""
         chain = RAGChain()
-        result = chain._build_context([])
+        result, count = chain._build_context([])
         assert result == ""
+        assert count == 0
 
     def test_build_context_single_doc(self):
         """测试单个文档上下文构建"""
@@ -41,8 +42,9 @@ class TestRAGChain:
                 page_content="这是测试内容", metadata={"source": "test.txt", "page": 1}
             )
         ]
-        result = chain._build_context(docs)
+        result, count = chain._build_context(docs)
 
+        assert count == 1
         assert "【文档 1】" in result
         assert "test.txt" in result
         assert "这是测试内容" in result
@@ -55,8 +57,9 @@ class TestRAGChain:
             Document(page_content="内容2", metadata={"source": "doc2.txt"}),
             Document(page_content="内容3", metadata={"source": "doc3.txt"}),
         ]
-        result = chain._build_context(docs)
+        result, count = chain._build_context(docs)
 
+        assert count == 3
         assert "【文档 1】" in result
         assert "【文档 2】" in result
         assert "【文档 3】" in result

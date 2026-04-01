@@ -810,162 +810,162 @@ def render_document_upload():
 
 
 # 问答界面
+@st.fragment
 def render_chat_interface():
-    """渲染问答界面（单次同步处理，避免 st.rerun 导致 tab 跳转）"""
-    with st.container():
-        st.markdown("### 💬 智能问答")
+    """渲染问答界面
 
-        # 聊天历史
-        chat_container = st.container()
-        with chat_container:
-            for message in st.session_state.messages:
-                with st.chat_message(message["role"]):
-                    st.markdown(message["content"])
-                    if "images" in message and message.get("images"):
-                        with st.expander("📷 相关图片"):
-                            imgs = message["images"]
-                            cols = st.columns(min(len(imgs), 3))
-                            for idx, img in enumerate(imgs):
-                                with cols[idx % len(cols)]:
-                                    img_path = img.get("path", "") if isinstance(img, dict) else img
-                                    caption = img.get("caption", "") if isinstance(img, dict) else ""
-                                    if img_path and Path(img_path).exists():
-                                        st.image(img_path, caption=caption or None, use_container_width=True)
-                    if "sources" in message:
-                        with st.expander("查看来源"):
-                            for source in message["sources"]:
-                                if isinstance(source, dict):
-                                    name = source.get("source", "未知")
-                                    score = source.get("score")
-                                    text = f"- {name}" + (f" (相关度: {score})" if score else "")
-                                else:
-                                    text = f"- {source}"
-                                st.markdown(text)
+    使用 st.fragment 隔离问答逻辑，使 chat_input 提交只 rerun 该 Fragment
+    而非整个页面，从而保持 tab 选中状态和其他组件不受影响。
+    """
+    st.markdown("### 💬 智能问答")
 
-        # 获取用户输入（不使用 rerun，在同一脚本执行中处理）
-        user_input = st.chat_input("输入您的问题...", key="chat_input")
+    # 聊天历史
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if "images" in message and message.get("images"):
+                with st.expander("📷 相关图片"):
+                    imgs = message["images"]
+                    cols = st.columns(min(len(imgs), 3))
+                    for idx, img in enumerate(imgs):
+                        with cols[idx % len(cols)]:
+                            img_path = img.get("path", "") if isinstance(img, dict) else img
+                            caption = img.get("caption", "") if isinstance(img, dict) else ""
+                            if img_path and Path(img_path).exists():
+                                st.image(img_path, caption=caption or None, use_container_width=True)
+            if "sources" in message:
+                with st.expander("查看来源"):
+                    for source in message["sources"]:
+                        if isinstance(source, dict):
+                            name = source.get("source", "未知")
+                            score = source.get("score")
+                            text = f"- {name}" + (f" (相关度: {score})" if score else "")
+                        else:
+                            text = f"- {source}"
+                        st.markdown(text)
 
-        if user_input:
-            # 立即显示用户消息
-            st.session_state.messages.append({"role": "user", "content": user_input})
-            with chat_container:
-                with st.chat_message("user"):
-                    st.markdown(user_input)
+    # 获取用户输入
+    user_input = st.chat_input("输入您的问题...", key="chat_input")
 
-            # 同步处理查询（不触发 rerun，保持 tab 状态）
-            with chat_container:
-                with st.chat_message("assistant"):
-                    with st.spinner("思考中..."):
+    if user_input:
+        # 显示用户消息
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        # 同步处理查询
+        with st.chat_message("assistant"):
+            with st.spinner("思考中..."):
+                try:
+                    import requests
+
+                    # 自动检测向量存储是否已初始化
+                    if not st.session_state.vector_store_initialized:
                         try:
-                            import requests
+                            stats_response = requests.get(
+                                "http://localhost:8000/api/v1/documents/stats",
+                                timeout=5,
+                            )
+                            if stats_response.status_code == 200:
+                                stats = stats_response.json()
+                                if stats.get("indexed_documents", 0) > 0:
+                                    st.session_state.vector_store_initialized = True
+                        except Exception as detect_e:
+                            logger.warning(f"检测向量存储状态失败: {detect_e}")
 
-                            # 自动检测向量存储是否已初始化
-                            if not st.session_state.vector_store_initialized:
-                                try:
-                                    stats_response = requests.get(
-                                        "http://localhost:8000/api/v1/documents/stats",
-                                        timeout=5,
-                                    )
-                                    if stats_response.status_code == 200:
-                                        stats = stats_response.json()
-                                        if stats.get("indexed_documents", 0) > 0:
-                                            st.session_state.vector_store_initialized = True
-                                except Exception as detect_e:
-                                    logger.warning(f"检测向量存储状态失败: {detect_e}")
+                    if not st.session_state.vector_store_initialized:
+                        error_msg = "向量存储未初始化，请先上传并处理文档"
+                        st.warning(error_msg)
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": error_msg}
+                        )
+                    else:
+                        # 构建请求参数
+                        selected_provider = st.session_state.selected_model
+                        request_body = {
+                            "question": user_input,
+                            "top_k": 4,
+                            "provider": selected_provider,
+                        }
 
-                            if not st.session_state.vector_store_initialized:
-                                error_msg = "向量存储未初始化，请先上传并处理文档"
-                                st.warning(error_msg)
-                                st.session_state.messages.append(
-                                    {"role": "assistant", "content": error_msg}
+                        # 优先使用 session_id（服务端管理历史）
+                        session_id = st.session_state.get("current_session_id")
+                        if session_id:
+                            request_body["session_id"] = session_id
+                        else:
+                            # 向后兼容：前端传历史
+                            history = []
+                            for msg in st.session_state.messages[:-1][-6:]:
+                                history.append(
+                                    {
+                                        "role": msg.get("role", "user"),
+                                        "content": msg.get("content", ""),
+                                    }
                                 )
-                            else:
-                                # 构建请求参数
-                                selected_provider = st.session_state.selected_model
-                                request_body = {
-                                    "question": user_input,
-                                    "top_k": 4,
-                                    "provider": selected_provider,
-                                }
+                            request_body["history"] = history
 
-                                # 优先使用 session_id（服务端管理历史）
-                                session_id = st.session_state.get("current_session_id")
-                                if session_id:
-                                    request_body["session_id"] = session_id
-                                else:
-                                    # 向后兼容：前端传历史
-                                    history = []
-                                    for msg in st.session_state.messages[:-1][-6:]:
-                                        history.append(
-                                            {
-                                                "role": msg.get("role", "user"),
-                                                "content": msg.get("content", ""),
-                                            }
-                                        )
-                                    request_body["history"] = history
+                        response = requests.post(
+                            "http://localhost:8000/api/v1/query",
+                            json=request_body,
+                            timeout=120,
+                        )
 
-                                response = requests.post(
-                                    "http://localhost:8000/api/v1/query",
-                                    json=request_body,
-                                    timeout=120,
-                                )
+                        if response.status_code == 200:
+                            result = response.json()
+                            answer = result.get("answer", "无法获取回答")
+                            sources = result.get("sources", [])
+                            images = result.get("images", [])
 
-                                if response.status_code == 200:
-                                    result = response.json()
-                                    answer = result.get("answer", "无法获取回答")
-                                    sources = result.get("sources", [])
-                                    images = result.get("images", [])
+                            st.session_state.messages.append(
+                                {"role": "assistant", "content": answer, "sources": sources, "images": images}
+                            )
 
-                                    st.session_state.messages.append(
-                                        {"role": "assistant", "content": answer, "sources": sources, "images": images}
-                                    )
-
-                                    st.markdown(answer)
-                                    if images:
-                                        with st.expander("📷 相关图片"):
-                                            cols = st.columns(min(len(images), 3))
-                                            for idx, img in enumerate(images):
-                                                with cols[idx % len(cols)]:
-                                                    img_path = img.get("path", "")
-                                                    caption = img.get("caption", "")
-                                                    if img_path and Path(img_path).exists():
-                                                        st.image(img_path, caption=caption or None, use_container_width=True)
-                                                    else:
-                                                        st.warning(f"图片不存在: {img_path}")
-                                    if sources:
-                                        with st.expander("查看参考来源"):
-                                            seen = set()
-                                            unique_sources = []
-                                            for s in sources:
-                                                name = s.get("source", s) if isinstance(s, dict) else s
-                                                filename = name.split("/")[-1].split("\\")[-1]
-                                                if filename not in seen:
-                                                    seen.add(filename)
-                                                    unique_sources.append(s)
-                                            for i, source in enumerate(unique_sources):
-                                                if isinstance(source, dict):
-                                                    name = source.get("source", "未知")
-                                                    score = source.get("score")
-                                                else:
-                                                    name = source
-                                                    score = None
-                                                filename = name.split("/")[-1].split("\\")[-1]
-                                                score_text = f" (相关度: {score})" if score else ""
-                                                st.markdown(f"{i + 1}. {filename}{score_text}")
-                                else:
-                                    error_msg = f"查询失败: {response.status_code}"
-                                    st.error(error_msg)
-                                    st.session_state.messages.append(
-                                        {"role": "assistant", "content": error_msg}
-                                    )
-
-                        except Exception as e:
-                            logger.error(f"生成回答失败: {e}")
-                            error_msg = f"生成回答失败: {e}"
+                            st.markdown(answer)
+                            if images:
+                                with st.expander("📷 相关图片"):
+                                    cols = st.columns(min(len(images), 3))
+                                    for idx, img in enumerate(images):
+                                        with cols[idx % len(cols)]:
+                                            img_path = img.get("path", "")
+                                            caption = img.get("caption", "")
+                                            if img_path and Path(img_path).exists():
+                                                st.image(img_path, caption=caption or None, use_container_width=True)
+                                            else:
+                                                st.warning(f"图片不存在: {img_path}")
+                            if sources:
+                                with st.expander("查看参考来源"):
+                                    seen = set()
+                                    unique_sources = []
+                                    for s in sources:
+                                        name = s.get("source", s) if isinstance(s, dict) else s
+                                        filename = name.split("/")[-1].split("\\")[-1]
+                                        if filename not in seen:
+                                            seen.add(filename)
+                                            unique_sources.append(s)
+                                    for i, source in enumerate(unique_sources):
+                                        if isinstance(source, dict):
+                                            name = source.get("source", "未知")
+                                            score = source.get("score")
+                                        else:
+                                            name = source
+                                            score = None
+                                        filename = name.split("/")[-1].split("\\")[-1]
+                                        score_text = f" (相关度: {score})" if score else ""
+                                        st.markdown(f"{i + 1}. {filename}{score_text}")
+                        else:
+                            error_msg = f"查询失败: {response.status_code}"
                             st.error(error_msg)
                             st.session_state.messages.append(
                                 {"role": "assistant", "content": error_msg}
                             )
+
+                except Exception as e:
+                    logger.error(f"生成回答失败: {e}")
+                    error_msg = f"生成回答失败: {e}"
+                    st.error(error_msg)
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": error_msg}
+                    )
 
 
 # 文档管理界面
@@ -1238,22 +1238,10 @@ def main():
     render_header()
     render_sidebar()
 
-    # 自定义 Tab 导航（st.tabs 在 rerun 时会重置为第一个 tab，导致页面跳转）
-    if "active_tab" not in st.session_state:
-        st.session_state.active_tab = 1  # 默认智能问答
+    # 创建标签页（st.tabs 在 Streamlit 1.54 中正确持久化 tab 选择）
+    tab1, tab2, tab3 = st.tabs(["📄 文档管理", "💬 智能问答", "🔧 系统设置"])
 
-    tab_options = ["📄 文档管理", "💬 智能问答", "🔧 系统设置"]
-    active = st.radio(
-        "功能导航",
-        tab_options,
-        index=st.session_state.active_tab,
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-    st.session_state.active_tab = tab_options.index(active)
-
-    # 根据选中 tab 渲染内容
-    if st.session_state.active_tab == 0:
+    with tab1:
         render_document_management()
         st.markdown("---")
         render_document_upload()
@@ -1261,10 +1249,10 @@ def main():
         st.markdown("### 🗑️ 删除文档")
         render_delete_document()
 
-    elif st.session_state.active_tab == 1:
+    with tab2:
         render_chat_interface()
 
-    elif st.session_state.active_tab == 2:
+    with tab3:
         render_system_info()
 
     # 页脚
