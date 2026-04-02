@@ -274,6 +274,17 @@ class RAGChain:
                     if key not in doc_scores:
                         doc_scores[key] = reranker.compute_score(question, doc)
 
+            # 3.5 相关性门控：最高分过低时视为未找到相关文档
+            # 避免不相关文档进入 LLM 上下文导致生成错误答案
+            if retrieved_docs and doc_scores:
+                max_score = max(doc_scores.values())
+                if max_score < 0.1:
+                    logger.info(
+                        f"检索文档相关性过低 (max_score={max_score:.3f})，"
+                        f"视为未找到相关文档"
+                    )
+                    retrieved_docs = []
+
             # 4. 构建上下文（按分数排序）
             context, num_docs_in_context = self._build_context(retrieved_docs, doc_scores)
 
@@ -304,22 +315,13 @@ class RAGChain:
                 else:
                     citation_report = []
             elif self.llm_manager:
-                # 无检索结果但有 LLM
-                history_context = self._build_history_section(history)
-                if history_context:
-                    prompt = (
-                        f"【对话历史】\n{history_context}\n\n"
-                        f"用户问题：{question}\n\n"
-                        f"知识库中没有找到与当前问题相关的文档。"
-                        f"请如实回答：如果你不确定或文档中没有相关信息，"
-                        f"请直接说明'根据提供的文档，无法回答这个问题'，不要编造答案。"
-                    )
-                else:
-                    prompt = (
-                        f"用户问题：{question}\n\n"
-                        f"知识库中没有找到相关文档。"
-                        f"请如实回答：如果你不确定，请直接说明无法回答，不要编造答案。"
-                    )
+                # 无检索结果：不传历史（防止历史污染回答），直接告知无法回答
+                prompt = (
+                    f"用户问题：{question}\n\n"
+                    f"知识库中没有找到与该问题相关的文档。"
+                    f"请只回答：根据提供的文档，无法回答这个问题。"
+                    f"不要提供任何其他信息，不要参考对话历史，不要编造答案。"
+                )
                 result = self.llm_manager.generate(prompt, provider=provider)
                 answer = result.get("text", "生成失败")
                 metadata = result.get("metadata", {})
@@ -464,6 +466,14 @@ class RAGChain:
         scores = [reranker.compute_score(question, doc) for doc in retrieved_docs]
         avg_score = sum(scores) / len(scores) if scores else 0.0
 
+        # 置信度门控：最高分已足够高时跳过 CRAG（节省 40-60% CRAG 调用）
+        max_score = max(scores) if scores else 0.0
+        if max_score >= 0.8:
+            logger.info(
+                f"CRAG: 最高分 {max_score:.2f} >= 0.8，检索质量足够，跳过 CRAG"
+            )
+            return retrieved_docs
+
         if avg_score >= self.crag_threshold:
             logger.info(
                 f"CRAG: 检索质量合格 ({avg_score:.2f} >= {self.crag_threshold})"
@@ -504,24 +514,68 @@ class RAGChain:
         return result
 
     def _rewrite_query(self, question: str) -> str:
-        """改写查询: 优先 LLM，fallback 到关键词提取。"""
-        # 尝试 LLM 改写
-        if self.llm_manager is not None:
-            try:
-                prompt = (
-                    f"请用不同方式重新表述以下问题，保持核心含义不变，"
-                    f"直接输出改写后的问题，不要解释。\n\n问题：{question}"
-                )
-                result = self.llm_manager.generate(prompt)
-                rewritten = result.get("text", "").strip()
-                if rewritten and rewritten != question and len(rewritten) > 2:
-                    logger.info(f"CRAG: LLM 改写 '{question[:20]}' → '{rewritten[:20]}'")
-                    return rewritten
-            except Exception as e:
-                logger.warning(f"CRAG: LLM 改写失败: {e}")
+        """改写查询: 使用规则方法提取关键词重新组合（快速、确定性）。
 
-        # 规则 fallback: 提取关键词重新组合
+        CRAG 改写结果通过 RRF 与原始检索结果融合，
+        因此即使改写效果不如 LLM，原始结果仍然保留。
+        """
         return self._keyword_rewrite(question)
+
+    def _is_topic_switch(self, question: str, history: list) -> bool:
+        """两层话题切换检测：关键词重叠 + embedding 余弦相似度。
+
+        用于在 History-Aware 改写前判断新问题是否与历史话题相关，
+        避免将无关新问题与旧话题混合导致检索到错误文档。
+
+        Returns:
+            True 表示检测到话题切换，应跳过改写。
+        """
+        if not history:
+            return True
+
+        import re
+
+        # Layer 1: 关键词重叠（快速，~0ms）
+        recent_text = " ".join(m.get("content", "") for m in history[-4:])
+
+        def _tokenize(text: str) -> set:
+            words = re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z]+", text)
+            stops = {
+                "的", "了", "是", "在", "有", "和", "与", "或", "不", "也", "都",
+                "请", "什么", "怎么", "如何", "为什么", "哪些", "这个", "那个",
+                "the", "is", "a", "an", "of", "in", "to", "and", "or", "for",
+                "what", "how", "why", "can", "do", "does",
+            }
+            return set(w.lower() for w in words if w.lower() not in stops and len(w) > 1)
+
+        q_tokens = _tokenize(question)
+        h_tokens = _tokenize(recent_text)
+        if not q_tokens or not h_tokens:
+            return True
+        overlap = len(q_tokens & h_tokens) / len(q_tokens)
+        if overlap < 0.2:
+            return True  # 关键词重叠 < 20%，视为话题切换
+
+        # Layer 2: Embedding 余弦相似度（~5ms，复用已有 embedding 模型）
+        try:
+            if self.vector_store and self.vector_store.embedder is not None:
+                import numpy as np
+
+                q_emb = self.vector_store.embedder.embed_query(question)
+                h_emb = self.vector_store.embedder.embed_query(recent_text[:200])
+                q_norm = np.linalg.norm(q_emb)
+                h_norm = np.linalg.norm(h_emb)
+                if q_norm > 0 and h_norm > 0:
+                    cos_sim = float(np.dot(q_emb, h_emb) / (q_norm * h_norm))
+                    if cos_sim < 0.3:
+                        logger.info(
+                            f"话题切换检测: embedding 余弦相似度 {cos_sim:.3f} < 0.3，跳过改写"
+                        )
+                        return True
+        except Exception as e:
+            logger.debug(f"话题切换 embedding 检测失败: {e}")
+
+        return False
 
     def _rewrite_query_with_history(
         self, question: str, history: Optional[List[Dict[str, str]]]
@@ -551,10 +605,8 @@ class RAGChain:
             r"(它|它们|他|她|这|那|这个|那个|这些|那些|其|该|上述|前者|后者|上面|之前|刚才)"
         )
         if not pronoun_pattern.search(question):
-            # 即使没有明确指代词，有历史时也改写以补充上下文
-            # 但为了减少不必要的 LLM 调用，仅在历史足够丰富时改写
-            if len(recent) < 2:
-                return question
+            # 无指代词 → 直接跳过改写（对齐行业做法）
+            return question
 
         if self.llm_manager is None:
             return question

@@ -3,6 +3,7 @@ FastAPI 主应用
 提供知识库系统的 REST API 接口
 """
 
+import json
 import logging
 import os
 import threading
@@ -12,6 +13,7 @@ from typing import Any, Dict, List, Optional
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from src.core.config import config
@@ -562,6 +564,178 @@ async def query_knowledge_base(request: QueryRequest):
     except Exception as e:
         logger.error(f"查询失败: {e}")
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+
+@app.post("/api/v1/query/stream")
+async def query_knowledge_base_stream(request: QueryRequest):
+    """流式查询知识库 — 检索同步完成后，LLM 生成阶段 SSE 流式输出。
+
+    SSE 事件格式：
+    - data: {"type": "status", "message": "..."}  — 检索进度提示
+    - data: {"type": "sources", "sources": [...]}  — 检索来源
+    - data: {"type": "token", "text": "..."}        — LLM 生成文本片段
+    - data: {"type": "done", "metadata": {...}}     — 生成完成
+    """
+    import time as _time
+
+    from src.core.session_manager import get_session_manager
+
+    start_time = _time.time()
+    session_id = request.session_id
+    history = request.history or []
+
+    if session_id:
+        sm = get_session_manager()
+        session = sm.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"会话不存在: {session_id}")
+        if not history:
+            history = sm.get_history(session_id)
+
+    def event_generator():
+        """同步生成器 — FastAPI 自动在线程池中运行，每个 yield 立即发送给客户端。"""
+        try:
+            # --- 阶段1: 检索（同步，与普通查询一致） ---
+            yield _sse_event({"type": "status", "message": "正在检索相关文档..."})
+
+            rag_chain = get_rag_chain()
+            question = request.question
+
+            # 复用 RAGChain 的检索逻辑（不生成）
+            effective_top_k = request.top_k if request.top_k is not None else rag_chain.retrieval_top_k
+            retrieval_question = rag_chain._rewrite_query_with_history(question, history)
+
+            retrieved_docs = []
+            if rag_chain.vector_store:
+                retrieved_docs = rag_chain._retrieve_documents(
+                    retrieval_question, k=effective_top_k, mode=request.retrieval_mode
+                )
+                if rag_chain.crag_enabled and retrieved_docs:
+                    retrieved_docs = rag_chain._corrective_retrieve(
+                        retrieval_question, retrieved_docs, effective_top_k
+                    )
+
+            # 计算相关性分数 + 门控
+            doc_scores: Dict[str, float] = {}
+            if retrieved_docs and question:
+                from src.core.vector_store import KeywordCoverageReranker
+                reranker = KeywordCoverageReranker()
+                for doc in retrieved_docs:
+                    key = doc.page_content
+                    if key not in doc_scores:
+                        doc_scores[key] = reranker.compute_score(question, doc)
+
+            # 相关性门控
+            if retrieved_docs and doc_scores:
+                max_score = max(doc_scores.values())
+                if max_score < 0.1:
+                    yield _sse_event({"type": "status", "message": "未找到相关文档"})
+                    retrieved_docs = []
+
+            # 构建上下文
+            context, num_docs = rag_chain._build_context(retrieved_docs, doc_scores)
+
+            # 构建来源列表
+            seen_sources = set()
+            unique_sources = []
+            for doc in retrieved_docs:
+                src = doc.metadata.get("source", "未知")
+                if src not in seen_sources:
+                    seen_sources.add(src)
+                    score = doc_scores.get(doc.page_content, 0.0)
+                    unique_sources.append({"source": src, "score": round(score, 3)})
+
+            yield _sse_event({"type": "sources", "sources": unique_sources})
+
+            # 提取图片
+            images = rag_chain._extract_images(retrieved_docs) if retrieved_docs else []
+
+            # --- 阶段2: LLM 流式生成 ---
+            llm_manager = get_llm_manager()
+
+            if context and llm_manager:
+                yield _sse_event({"type": "status", "message": "正在生成回答..."})
+                prompt = rag_chain._build_prompt(question, context, history, num_docs=num_docs)
+
+                full_answer = ""
+                for chunk in llm_manager.generate_stream(prompt, provider=request.provider):
+                    full_answer += chunk
+                    yield _sse_event({"type": "token", "text": chunk})
+
+                # 溯源验证
+                citation_report = []
+                if rag_chain.citation_verify_enabled:
+                    full_answer, citation_report = rag_chain._verify_citations(
+                        full_answer, num_docs
+                    )
+
+                answer = full_answer
+            elif llm_manager:
+                # 无检索结果
+                prompt = (
+                    f"用户问题：{question}\n\n"
+                    f"知识库中没有找到与该问题相关的文档。"
+                    f"请只回答：根据提供的文档，无法回答这个问题。"
+                    f"不要提供任何其他信息，不要参考对话历史，不要编造答案。"
+                )
+                full_answer = ""
+                for chunk in llm_manager.generate_stream(prompt, provider=request.provider):
+                    full_answer += chunk
+                    yield _sse_event({"type": "token", "text": chunk})
+                answer = full_answer
+                unique_sources = []
+                images = []
+                citation_report = []
+            else:
+                answer = "知识库为空且 LLM 未初始化，请先添加文档并配置 LLM。"
+                yield _sse_event({"type": "token", "text": answer})
+                unique_sources = []
+                images = []
+                citation_report = []
+
+            response_time = _time.time() - start_time
+
+            # 持久化到会话
+            if session_id:
+                try:
+                    sm = get_session_manager()
+                    sm.add_message(session_id, "user", request.question)
+                    sm.add_message(
+                        session_id, "assistant", answer,
+                        sources=unique_sources if unique_sources else None,
+                    )
+                except Exception as e:
+                    logger.warning(f"会话消息持久化失败: {e}")
+
+            yield _sse_event({
+                "type": "done",
+                "metadata": {
+                    "sources": unique_sources,
+                    "images": images,
+                    "response_time": round(response_time, 2),
+                    "session_id": session_id,
+                    "citation_report": citation_report,
+                },
+            })
+
+        except Exception as e:
+            logger.error(f"流式查询失败: {e}")
+            yield _sse_event({"type": "error", "message": str(e)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _sse_event(data: dict) -> str:
+    """构建 SSE 事件字符串"""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 # ==================== 会话管理 API ====================

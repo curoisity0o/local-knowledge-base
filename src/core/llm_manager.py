@@ -9,7 +9,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 from langchain_ollama import OllamaLLM
 from langchain_openai import ChatOpenAI
@@ -457,6 +457,46 @@ class LLMManager:
                         "response_time": time.time() - start_time,
                     },
                 }
+
+    def generate_stream(
+        self,
+        prompt: str,
+        provider: Optional[str] = None,
+    ) -> Generator[str, None, None]:
+        """流式生成回答，逐 token yield 文本片段。
+
+        优先使用指定 provider，否则自动选择。
+        支持本地 Ollama 和所有 API 提供商的流式输出。
+        """
+        # 选择提供商
+        if provider is None:
+            query_features = self.analyze_query(prompt)
+            provider = self.select_provider(query_features)
+
+        try:
+            if provider == "local" and self.local_llm:
+                logger.info(f"流式生成(本地): {prompt[:50]}...")
+                for chunk in self.local_llm.stream(prompt):
+                    text = chunk if isinstance(chunk, str) else getattr(chunk, "content", str(chunk))
+                    if text:
+                        yield text
+            elif provider in self.api_clients:
+                logger.info(f"流式生成(API-{provider}): {prompt[:50]}...")
+                client = self.api_clients[provider]
+                for chunk in client.stream(prompt):
+                    text = getattr(chunk, "content", None) if hasattr(chunk, "content") else str(chunk)
+                    if text:
+                        yield text
+            else:
+                # 后备：非流式生成后一次性返回
+                logger.warning(f"流式后备: provider={provider} 不可用，回退到同步生成")
+                result = self._fallback_generate(prompt)
+                text = result.get("text", "")
+                if text:
+                    yield text
+        except Exception as e:
+            logger.error(f"流式生成失败: {e}")
+            yield f"[生成失败: {str(e)}]"
 
     def _generate_local(self, prompt: str, **kwargs) -> Dict[str, Any]:
         """使用本地模型生成"""

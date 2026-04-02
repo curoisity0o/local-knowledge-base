@@ -232,12 +232,11 @@ class TestCRAG:
         assert result == []
 
     def test_corrective_retrieve_triggers_rewrite(self):
-        """测试 CRAG: 质量低时触发改写重试"""
+        """测试 CRAG: 质量低时触发改写重试（规则改写，不调用 LLM）"""
         chain = RAGChain()
         chain.crag_threshold = 0.8  # 高阈值，几乎不可能达到
         chain.crag_enabled = True
         chain.llm_manager = MagicMock()
-        chain.llm_manager.generate.return_value = {"text": "改写后的问题"}
 
         # 模拟 _retrieve_documents 返回更好的结果
         chain._retrieve_documents = MagicMock(return_value=[
@@ -245,10 +244,11 @@ class TestCRAG:
         ])
 
         docs = [Document(page_content="完全不相关的内容", metadata={"source": "a"})]
-        result = chain._corrective_retrieve("模糊问题", docs, k=4)
+        # 使用带前缀的问题，关键词规则改写会去掉前缀触发重试
+        result = chain._corrective_retrieve("什么是模糊问题", docs, k=4)
 
-        # 应该触发了改写和重试
-        chain.llm_manager.generate.assert_called_once()
+        # CRAG 应触发了规则改写（不调用 LLM generate）和重试
+        chain.llm_manager.generate.assert_not_called()
         chain._retrieve_documents.assert_called_once()
         # 结果应该包含原始和重试的文档
         assert len(result) >= 1
